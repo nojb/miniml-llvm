@@ -187,7 +187,7 @@ module Llvmgen = struct
         Low.call c v vl
 
   and compile_tail c env = function
-    | Cint _ | Cvar _ | Cprimitive _ as e -> (* TODO tail call *)
+    | Cint _ | Cvar _ | Cprimitive _ | Clabel _ as e -> (* TODO tail call *)
         Low.ret c (compile c env e)
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
@@ -235,9 +235,13 @@ module Llvmgen = struct
 end
 
 let () =
+  let open Closure in
   let prog =
     [
-      "test", [], Int, Closure.Cint 0
+      "test", ["a", Int; "b", Int], Int,
+      Clet ("x1", Int, Cint 7,
+            Clet ("x2", Int, Cprimitive (Paddint, ["x1"; "b"]),
+                  Cprimitive (Paddint, ["a"; "x2"])))
     ]
   in
   Llvmgen.compile (Prog (prog, ""))
