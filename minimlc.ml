@@ -30,6 +30,26 @@ type kind =
   | Ptr
   | Int
 
+let string_of_kind = function
+  | Ptr -> "ptr"
+  | Int -> "int"
+
+let string_of_primitive = function
+  | Pmakeblock -> "makeblock"
+  | Pgetfield i -> Printf.sprintf "getfield %d" i
+  | Paddint -> "+"
+
+module Knf = struct
+  type knf =
+    | Kint of int
+    | Kvar of string
+    | Kifthenelse of string * knf * knf
+    | Klet of string * kind * knf * knf
+    | Kletrec of (string * (string * kind) * kind * knf) list * knf
+    | Kapply of string * string list
+    | Kprimitive of primitive * string list
+end
+
 module Closure = struct
   type clambda =
     | Cint of int
@@ -41,6 +61,47 @@ module Closure = struct
     | Cprimitive of primitive * string list
   type program =
     | Prog of (string * (string * kind) list * kind * clambda) list * string
+
+  let rec print ppf = function
+    | Cint n ->
+        Format.pp_print_int ppf n
+    | Clabel id ->
+        Format.fprintf ppf "#%s" id
+    | Cvar id ->
+        Format.pp_print_string ppf id
+    | Cifthenelse (id, e1, e2) ->
+        Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
+    | Clet (id, k, e1, e2) ->
+        Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
+    | Capply (id, idl) ->
+        Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
+    | Cprimitive (prim, idl) ->
+        Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
+
+  and print_args ppf = function
+    | [] -> ()
+    | x :: xs -> Format.fprintf ppf "@ %s%a" x print_args xs
+
+  let rec print_params ppf = function
+    | [] -> ()
+    | (x, k) :: [] ->
+        Format.fprintf ppf "%s %s" x (string_of_kind k)
+    | (x, k) :: xs ->
+        Format.fprintf ppf "%s %s@ %a" x (string_of_kind k) print_params xs
+
+  let rec print_funs ppf = function
+    | [] -> ()
+    | (name, params, _, body) :: funs ->
+        Format.fprintf ppf "@ @[<2>(%s@ (%a)@ %a)@ %a@]"
+          name print_params params print body print_funs funs
+
+  let print_program ppf (Prog (funs, main)) =
+    Format.fprintf ppf "@[<2>(letrec%a(%s))@]" print_funs funs main
+
+  open Knf
+
+  let rec compile = function
+    | _ -> failwith "Closure.compile: not implemented"
 end
 
 module Low : sig
@@ -222,7 +283,8 @@ module Llvmgen = struct
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Low.ret c v
 
-  let compile (Prog (funs, main)) =
+  let compile (Prog (funs, main) as prog) =
+    Format.printf "@[Compiling...@\n%a@]@." print_program prog;
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
@@ -260,4 +322,4 @@ let () =
                   Cprimitive (Paddint, ["a"; "x2"])))
     ]
   in
-  Llvmgen.compile (Prog (prog, ""))
+  Llvmgen.compile (Prog (prog, "test"))
