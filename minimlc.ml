@@ -350,6 +350,7 @@ module Llvmgen = struct
     | Capply _ as e ->
         let v = compile c env e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
+        Llvm.set_tail_call true v;
         Low.ret c v
 
   let compile (Prog (funs, main) as prog) =
