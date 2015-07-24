@@ -69,13 +69,12 @@ module Closure = struct
     | Capply of string * string list
     | Cprimitive of primitive * string list
   type program =
-    | Prog of (string * (string * kind) list * kind * clambda) list * string
+    | Prog of (string * (string * kind) list * kind * clambda) list * clambda
 
   type value =
     | Vint of int
     | Vtuple of value list
-    | Vfun of (value list -> value)
-    | Vproxy of value ref
+    | Vfun of (value list -> value) ref
 
   let rec print_value ppf = function
     | Vint n ->
@@ -84,8 +83,6 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(%a)@]" print_values vl
     | Vfun _ ->
         Format.pp_print_string ppf "<fun>"
-    | Vproxy r ->
-        print_value ppf !r
 
   and print_values ppf = function
     | [] -> ()
@@ -105,8 +102,7 @@ module Closure = struct
         eval (M.add id (eval env e1) env) e2
     | Capply (id, idl) ->
         let f = match find id env with
-          | Vfun f
-          | Vproxy {contents = Vfun f} -> f
+          | Vfun r -> !r
           | _ -> assert false
         in
         f (List.map (fun id -> find id env) idl)
@@ -141,7 +137,7 @@ module Closure = struct
 
   let eval_program (Prog (funs, main)) =
     let env =
-      List.fold_left (fun env (name, _, _, _) -> M.add name (Vproxy (ref (Vint 0))) env)
+      List.fold_left (fun env (name, _, _, _) -> M.add name (Vfun (ref (fun _ -> Vint 0))) env)
         M.empty funs
     in
     List.iter (fun (name, args, _, body) ->
@@ -151,12 +147,12 @@ module Closure = struct
           eval env body
         in
         let r = match M.find name env with
-          | Vproxy r -> r
+          | Vfun r -> r
           | _ -> assert false
         in
-        r := Vfun f;
+        r := f;
       ) funs;
-    eval env (Capply (main, []))
+    eval env main
 
   let rec print ppf = function
     | Cint n ->
@@ -196,7 +192,7 @@ module Closure = struct
         Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
 
   let print_program ppf (Prog (funs, main)) =
-    Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@,(%s)@])@]" print_funs funs main
+    Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ %a@])@]" print_funs funs print main
 
   open Knf
 
@@ -393,9 +389,7 @@ module Llvmgen = struct
         Llvm.set_tail_call true v;
         Low.ret c v
 
-  let compile (Prog (funs, main) as prog) =
-    Format.printf "@[Compiling...@\n%a@]@." print_program prog;
-    Format.printf "@[Running...%a\n@]@." print_value (eval_program prog);
+  let compile (Prog (funs, main)) =
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
@@ -420,6 +414,9 @@ module Llvmgen = struct
         Low.position_at_end c (Llvm.entry_block f);
         compile_tail c env body
       ) funs;
+    let mainf = Low.define_function c "main" [] (Low.int_type c) in
+    Low.position_at_end c (Llvm.entry_block mainf);
+    compile_tail c env main;
     Low.dump_module c;
     Low.llmodule c
 end
@@ -445,19 +442,21 @@ let fact n =
                ("x2", Int, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
        Cint 1)
   in
-  let factn n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
   let prog =
     [
       "fact", ["n", Int], Int, fact;
-      "factn", [], Int, factn n
     ]
   in
-  let m = Llvmgen.compile (Prog (prog, "factn")) in
+  let main n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
+  let prog = Prog (prog, main n) in
+  Format.printf "@[%a@]@." print_program prog;
+  Format.printf "@[%a\n@]@." print_value (eval_program prog);
+  let m = Llvmgen.compile prog in
   if not (Llvm_executionengine.initialize ()) then
     failwith "Execution engine could not be initialized";
   let ee = Llvm_executionengine.create m in
   let f =
-    Llvm_executionengine.get_function_address "factn"
+    Llvm_executionengine.get_function_address "main"
       Ctypes.(Foreign.funptr (void @-> returning int)) ee
   in
   let n = f () in
