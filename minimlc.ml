@@ -63,6 +63,88 @@ module Knf = struct
     | Kapply of string * kind * string list
     | Kprimitive of primitive * string list
 
+  type value =
+    | Vint of int
+    | Vtuple of value list
+    | Vfun of (value list -> value) ref
+
+  let rec print_value ppf = function
+    | Vint n ->
+        Format.pp_print_int ppf n
+    | Vtuple vl ->
+        Format.fprintf ppf "@[<2>(%a)@]" print_values vl
+    | Vfun _ ->
+        Format.pp_print_string ppf "<fun>"
+
+  and print_values ppf = function
+    | [] -> ()
+    | v :: [] -> print_value ppf v
+    | v :: vl -> Format.fprintf ppf "%a@ %a" print_value v print_values vl
+
+  let rec eval env = function
+    | Kint n -> Vint n
+    | Kvar id -> find id env
+    | Kifthenelse (id, e1, e2) ->
+        let n = match find id env with
+          | Vint n -> n
+          | _ -> assert false
+        in
+        if n = 0 then eval env e2 else eval env e1
+    | Klet (id, _, e1, e2) ->
+        eval (M.add id (eval env e1) env) e2
+    | Kletrec (funs, e) ->
+        let env =
+          List.fold_left (fun env (name, _, _, _) -> M.add name (Vfun (ref (fun _ -> Vint 0))) env)
+            env funs
+        in
+        List.iter (fun (name, args, _, body) ->
+            let f vl =
+              assert (List.length vl = List.length args);
+              let env = List.fold_left2 (fun env (id, _) v -> M.add id v env) env args vl in
+              eval env body
+            in
+            let r = match M.find name env with
+              | Vfun r -> r
+              | _ -> assert false
+            in
+            r := f;
+          ) funs;
+        eval env e
+    | Kapply (id, _, idl) ->
+        let f = match find id env with
+          | Vfun r -> !r
+          | _ -> assert false
+        in
+        f (List.map (fun id -> find id env) idl)
+    | Kprimitive (Pmakeblock, idl) ->
+        Vtuple (List.map (fun id -> find id env) idl)
+    | Kprimitive (Pgetfield i, [id]) ->
+        let l = match find id env with
+          | Vtuple l ->  l
+          | _ -> assert false
+        in
+        List.nth l i
+    | Kprimitive (Paddint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 + n2)
+    | Kprimitive (Pmulint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 * n2)
+    | Kprimitive (Psubint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 - n2)
+    | Kprimitive _ ->
+        assert false
+
   let rec print ppf = function
     | Kint n ->
         Format.pp_print_int ppf n
