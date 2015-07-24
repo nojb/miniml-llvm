@@ -48,6 +48,7 @@ let gentmp =
   fun () -> let i = !count in incr count; Printf.sprintf "T%d" i
 
 module M = Map.Make (String)
+module S = Set.Make (String)
 
 let find id env =
   try M.find id env with Not_found -> failwith "find: %S not found" id
@@ -58,9 +59,27 @@ module Knf = struct
     | Kvar of string
     | Kifthenelse of string * knf * knf
     | Klet of string * kind * knf * knf
-    | Kletrec of (string * (string * kind) * kind * knf) list * knf
+    | Kletrec of (string * (string * kind) list * kind * knf) list * knf
     | Kapply of string * kind * string list
     | Kprimitive of primitive * string list
+
+  let rec fv = function
+    | Kint _ -> S.empty
+    | Kvar id -> S.singleton id
+    | Kifthenelse (id, e1, e2) -> S.add id (S.union (fv e1) (fv e2))
+    | Klet (id, _, e1, e2) -> S.union (fv e1) (S.remove id (fv e2))
+    | Kletrec (funs, e) ->
+        let fve =
+          List.fold_left (fun s (id, _, _, _) -> S.remove id s) (fv e) funs
+        in
+        List.fold_left S.union fve (List.map fv_fun funs)
+    | Kapply (id, _, idl) ->
+        List.fold_left (fun s id -> S.add id s) S.empty (id :: idl) (* check id *)
+    | Kprimitive (_, idl) ->
+        List.fold_left (fun s id -> S.add id s) S.empty idl
+
+  and fv_fun (id, args, _, body) =
+    List.fold_left (fun s id -> S.remove id s) (fv body) (id :: List.map fst args)
 end
 
 module Closure = struct
@@ -200,7 +219,7 @@ module Closure = struct
 
   open Knf
 
-  let all_funs : (string * (string * kind) * kind * clambda) list ref = ref []
+  let all_funs : (string * (string * kind) list * kind * clambda) list ref = ref []
 
   let rec transl env = function
     | Kint n ->
@@ -212,7 +231,29 @@ module Closure = struct
     | Klet (id, k, e1, e2) ->
         Clet (id, k, transl env e1, transl (M.add id k env) e2)
     | Kletrec (funs, e) ->
-        assert false
+        let fvs =
+          List.fold_left (fun s (id, args, _, e) ->
+              List.fold_left (fun s id -> S.remove id s) (fv e) (id :: List.map fst args)
+            ) S.empty funs
+        in
+        let fvs = S.elements fvs in
+        List.fold_right (fun (id, args, k, body) e ->
+            let clos = gentmp () in
+            let i = ref (List.length fvs - 1) in
+            let body =
+              List.fold_right (fun fv e ->
+                  let n = !i in
+                  decr i;
+                  Clet (fv, find fv env, Cprimitive (Pgetfield n, [clos]), e)
+                ) fvs (transl (List.fold_left (fun env (id, k) -> M.add id k env) env args) body)
+            in
+            all_funs := (id, (clos, Ptr) :: args, k, body) :: !all_funs;
+            let ff = gentmp () in
+            Clet
+              (clos, Ptr, Cprimitive (Pmakeblock, fvs), Clet
+                 (ff, Int, Clabel id, Clet
+                    (ff, Ptr, Cprimitive (Pmakeblock, [ff; clos]), e)))
+          ) funs (transl env e)
     | Kapply (id, k, idl) ->
         let tmp1 = gentmp () in
         let tmp2 = gentmp () in
