@@ -69,6 +69,7 @@ module Low : sig
   val insertion_block : t -> Llvm.llbasicblock
   val add : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
   val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
+  val malloc : t -> int -> Llvm.llvalue
 end = struct
   type t =
     { c : Llvm.llcontext;
@@ -121,6 +122,10 @@ end = struct
   let insertion_block c = Llvm.insertion_block c.b
   let add c v1 v2 = Llvm.build_add v1 v2 "" c.b
   let call c v vl = Llvm.build_call v (Array.of_list vl) "" c.b
+  let malloc c n =
+    let t = Llvm.function_type (ptr_type c) [| Llvm.i32_type c.c |] in
+    let f = Llvm.declare_function "malloc" t c.m in
+    Llvm.build_call f [| Llvm.const_int (Llvm.i32_type c.c) (n * Sys.word_size / 8) |] "" c.b
 end
 
 module Llvmgen = struct
@@ -135,6 +140,11 @@ module Llvmgen = struct
     match find id env with
     | (v, Ptr) -> v
     | (v, Int) -> Low.inttoptr c v
+
+  let toint c id env =
+    match find id env with
+    | (v, Ptr) -> Low.ptrtoint c v
+    | (v, Int) -> v
 
   let rec compile c env = function
     | Cint n ->
@@ -172,8 +182,10 @@ module Llvmgen = struct
         Low.store c (Llvm.const_null (Low.ptr_type c)) a;
         v
     | Cprimitive (Pmakeblock, idl) ->
-        let vl = List.map (fun id -> find id env) idl in
-        assert false
+        let vl = List.map (fun id -> toint c id env) idl in
+        let v = Low.malloc c (List.length idl) in
+        List.iteri (fun i v -> Low.store c v (Low.gep c v [Low.int c i])) vl;
+        v
     | Cprimitive (Pgetfield i, [id]) ->
         let v = toptr c id env in
         Low.gep c v [Low.int c i]
