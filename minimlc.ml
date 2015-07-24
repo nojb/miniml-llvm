@@ -25,7 +25,6 @@ type primitive =
   | Pmakeblock
   | Pgetfield of int
   | Paddint
-  | Pmulint
 
 type kind =
   | Ptr
@@ -181,6 +180,10 @@ module Llvmgen = struct
         let v = compile c (M.add id (a, Ptr) env) e2 in
         Low.store c (Llvm.const_null (Low.ptr_type c)) a;
         v
+    | Capply (id, idl) ->
+        let v = Low.lookup_function c id in
+        let vl = List.map (fun id -> fst (find id env)) idl in
+        Low.call c v vl
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> toint c id env) idl in
         let v = Low.malloc c (List.length idl) in
@@ -193,10 +196,8 @@ module Llvmgen = struct
         let v1, _ = find id1 env in
         let v2, _ = find id2 env in
         Low.add c v1 v2
-    | Capply (id, idl) ->
-        let v = Low.lookup_function c id in
-        let vl = List.map (fun id -> fst (find id env)) idl in
-        Low.call c v vl
+    | Cprimitive _ ->
+        assert false
 
   and compile_tail c env = function
     | Cint _ | Cvar _ | Cprimitive _ | Clabel _ as e -> (* TODO tail call *)
