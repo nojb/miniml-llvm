@@ -238,7 +238,10 @@ module Llvmgen = struct
         let (f, _) = find name env in
         let params = Array.to_list (Llvm.params f) in
         let env =
-          List.fold_left2 (fun env (id, k) v -> M.add id (v, k) env) env args params
+          List.fold_left2 (fun env (id, k) v ->
+              Llvm.set_value_name id v;
+              M.add id (v, k) env
+            ) env args params
         in
         Low.position_at_end c (Llvm.entry_block f);
         compile_tail c env body
