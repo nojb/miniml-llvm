@@ -129,7 +129,7 @@ module Llvmgen = struct
   module M = Map.Make (String)
 
   let find id env =
-    try M.find id env with Not_found -> failwith "Llvm.find: %S not found" id
+    try M.find id env with Not_found -> failwith "Llvmgen.find: %S not found" id
 
   let toptr c id env =
     match find id env with
