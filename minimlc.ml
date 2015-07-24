@@ -47,19 +47,22 @@ end
 module Low : sig
   type t
   val create : string -> t
+  val int_type : t -> Llvm.lltype
+  val ptr_type : t -> Llvm.lltype
   val int : t -> int -> Llvm.llvalue
   val load : t -> Llvm.llvalue -> Llvm.llvalue
+  val store : t -> Llvm.llvalue -> Llvm.llvalue -> unit
   val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
   val inttoptr : t -> Llvm.llvalue -> Llvm.llvalue
+  val ptrtoint : t -> Llvm.llvalue -> Llvm.llvalue
   val ret : t -> Llvm.llvalue -> unit
   val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
   val phi : t -> (Llvm.llvalue * Llvm.llbasicblock) list -> Llvm.llvalue
+  val alloca : t -> Llvm.lltype -> Llvm.llvalue
   val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
   val append_block : t -> Llvm.llbasicblock
   val position_at_end : t -> Llvm.llbasicblock -> unit
   val lookup_global : t -> string -> Llvm.llvalue
-  val pointer_type : t -> Llvm.lltype
-  val int_type : t -> Llvm.lltype
   val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
   val dump_module : t -> unit
   val insertion_block : t -> Llvm.llbasicblock
@@ -73,14 +76,22 @@ end = struct
     let b = Llvm.builder c in
     let m = Llvm.create_module c name in
     { c; b; m }
+  let int_type c =
+    match Sys.word_size with
+    | 32 -> Llvm.i32_type c.c
+    | 64 -> Llvm.i64_type c.c
+    | _ -> assert false
+  let ptr_type c = Llvm.pointer_type (int_type c)
   let int c n = Llvm.const_int (Llvm.i32_type c.c) n
   let load c v = Llvm.build_load v "" c.b
+  let store c v p = ignore (Llvm.build_store v p c.b)
   let gep c v vl = Llvm.build_gep v (Array.of_list vl) "" c.b
-  let inttoptr c v =
-    Llvm.build_inttoptr v (Llvm.pointer_type (Llvm.i32_type c.c)) "" c.b
+  let inttoptr c v = Llvm.build_inttoptr v (ptr_type c) "" c.b
+  let ptrtoint c v = Llvm.build_ptrtoint v (int_type c) "" c.b
   let ret c v = ignore (Llvm.build_ret v c.b)
   let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
   let phi c l = Llvm.build_phi l "" c.b
+  let alloca c t = Llvm.build_alloca t "" c.b
   let cond_br c v =
     let f = Llvm.block_parent (Llvm.insertion_block c.b) in
     let bb1 = Llvm.append_block c.c "" f in
@@ -96,8 +107,6 @@ end = struct
     match Llvm.lookup_global id c.m with
     | None -> failwith "Low: global %S not found" id
     | Some v -> v
-  let pointer_type c = Llvm.pointer_type (Llvm.i32_type c.c)
-  let int_type c = Llvm.i32_type c.c
   let define_function c name atyps rtype =
     Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
   let dump_module c = Llvm.dump_module c.m
@@ -124,10 +133,8 @@ module Llvmgen = struct
         Low.lookup_global c id
     | Cvar id ->
         begin match find id env with
-        | (v, Ptr) ->
-            Low.load c v
-        | (v, Int) ->
-            v
+        | (v, Ptr) -> Low.load c v
+        | (v, Int) -> v
         end
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
@@ -144,6 +151,11 @@ module Llvmgen = struct
         Low.phi c [v1, bb1; v2, bb2]
     | Clet (id, Int, e1, e2) ->
         compile c (M.add id (compile c env e1, Int) env) e2
+    | Clet (id, Ptr, e1, e2) ->
+        let v = compile c env e1 in
+        let a = Low.alloca c (Low.ptr_type c) in
+        Low.store c v a;
+        compile c (M.add id (a, Ptr) env) e2
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> find id env) idl in
         assert false
@@ -164,15 +176,20 @@ module Llvmgen = struct
         compile_tail c env e2
     | Clet (id, Int, e1, e2) ->
         compile_tail c (M.add id (compile c env e1, Int) env) e2
+    | Clet (id, Ptr, e1, e2) ->
+        let v = compile c env e1 in
+        let a = Low.alloca c (Low.ptr_type c) in
+        Low.store c v a;
+        compile_tail c (M.add id (a, Ptr) env) e2
 
   let compile (Prog (funs, main)) =
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
           let atyps =
-            List.map (function (_, Ptr) -> Low.pointer_type c | (_, Int) -> Low.int_type c) args
+            List.map (function (_, Ptr) -> Low.ptr_type c | (_, Int) -> Low.int_type c) args
           in
-          let rtype = match ret with Ptr -> Low.pointer_type c | Int -> Low.int_type c in
+          let rtype = match ret with Ptr -> Low.ptr_type c | Int -> Low.int_type c in
           let f = Low.define_function c name atyps rtype in
           M.add name (f, Int) env
         ) M.empty funs
