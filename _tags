@@ -1,0 +1,2 @@
+true: package(llvm)
+true: bin_annot
