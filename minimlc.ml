@@ -43,6 +43,10 @@ let string_of_primitive = function
   | Pmulint -> "*"
   | Psubint -> "-"
 
+let gentmp =
+  let count = ref 0 in
+  fun () -> let i = !count in incr count; Printf.sprintf "T%d" i
+
 module M = Map.Make (String)
 
 let find id env =
@@ -55,7 +59,7 @@ module Knf = struct
     | Kifthenelse of string * knf * knf
     | Klet of string * kind * knf * knf
     | Kletrec of (string * (string * kind) * kind * knf) list * knf
-    | Kapply of string * string list
+    | Kapply of string * kind * string list
     | Kprimitive of primitive * string list
 end
 
@@ -196,8 +200,20 @@ module Closure = struct
 
   open Knf
 
-  let rec compile = function
-    | _ -> failwith "Closure.compile: not implemented"
+  let rec transl env = function
+    | Kint n ->
+        Cint n
+    | Klet (id, k, e1, e2) ->
+        Clet (id, k, transl env e1, transl (M.add id k env) e2)
+    | Kapply (id, k, idl) ->
+        let tmp1 = gentmp () in
+        let tmp2 = gentmp () in
+        Clet
+          (tmp1, Int, Cprimitive (Pgetfield 0, [id]), Clet
+             (tmp2, Ptr, Cprimitive (Pgetfield 1, [id]), Capply
+                (tmp1, k, tmp2 :: idl)))
+    | _ ->
+        failwith "Closure.compile: not implemented"
 end
 
 module Low : sig
