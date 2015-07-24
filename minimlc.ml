@@ -63,6 +63,43 @@ module Knf = struct
     | Kapply of string * kind * string list
     | Kprimitive of primitive * string list
 
+  let rec print ppf = function
+    | Kint n ->
+        Format.pp_print_int ppf n
+    | Kvar id ->
+        Format.pp_print_string ppf id
+    | Kifthenelse (id, e1, e2) ->
+        Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
+    | Klet (id, k, e1, e2) ->
+        Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
+    | Kletrec (funs, e) ->
+        Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ %a@])@]" print_funs funs print e
+    | Kapply (id, _, idl) ->
+        Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
+    | Kprimitive (prim, idl) ->
+        Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
+
+  and print_args ppf = function
+    | [] -> ()
+    | x :: xs -> Format.fprintf ppf "@ %s%a" x print_args xs
+
+  and print_params ppf = function
+    | [] -> ()
+    | (x, k) :: [] ->
+        Format.fprintf ppf "%s %s" x (string_of_kind k)
+    | (x, k) :: xs ->
+        Format.fprintf ppf "%s %s@ %a" x (string_of_kind k) print_params xs
+
+  and print_fun ppf (name, params, _, body) =
+    Format.fprintf ppf "@[<2>(%s@ (%a)@ %a)@]" name print_params params print body
+
+  and print_funs ppf = function
+    | [] -> ()
+    | f :: [] ->
+        print_fun ppf f
+    | f :: funs ->
+        Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
+
   let rec fv = function
     | Kint _ -> S.empty
     | Kvar id -> S.singleton id
@@ -266,8 +303,8 @@ module Closure = struct
 
   let transl_program e =
     all_funs := [];
-    let e = transl e in
-    !all_funs, e
+    let e = transl M.empty e in
+    Prog (!all_funs, e)
 end
 
 module Low : sig
