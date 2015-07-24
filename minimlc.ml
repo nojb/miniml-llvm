@@ -62,6 +62,7 @@ module Low : sig
   val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
   val append_block : t -> Llvm.llbasicblock
   val position_at_end : t -> Llvm.llbasicblock -> unit
+  val entry_block : t -> Llvm.llbasicblock
   val lookup_global : t -> string -> Llvm.llvalue
   val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
   val dump_module : t -> unit
@@ -103,6 +104,9 @@ end = struct
     Llvm.append_block c.c "" f
   let position_at_end c bb =
     Llvm.position_at_end bb c.b
+  let entry_block c =
+    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
+    Llvm.entry_block f
   let lookup_global c id =
     match Llvm.lookup_global id c.m with
     | None -> failwith "Low: global %S not found" id
@@ -153,9 +157,14 @@ module Llvmgen = struct
         compile c (M.add id (compile c env e1, Int) env) e2
     | Clet (id, Ptr, e1, e2) ->
         let v = compile c env e1 in
+        let bb = Low.insertion_block c in
+        Low.position_at_end c (Low.entry_block c);
         let a = Low.alloca c (Low.ptr_type c) in
+        Low.position_at_end c bb;
         Low.store c v a;
-        compile c (M.add id (a, Ptr) env) e2
+        let v = compile c (M.add id (a, Ptr) env) e2 in
+        Low.store c (Llvm.const_null (Low.ptr_type c)) a;
+        v
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> find id env) idl in
         assert false
