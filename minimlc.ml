@@ -25,6 +25,8 @@ type primitive =
   | Pmakeblock
   | Pgetfield of int
   | Paddint
+  | Pmulint
+  | Psubint
 
 type kind =
   | Ptr
@@ -38,6 +40,8 @@ let string_of_primitive = function
   | Pmakeblock -> "makeblock"
   | Pgetfield i -> Printf.sprintf "getfield %d" i
   | Paddint -> "+"
+  | Pmulint -> "*"
+  | Psubint -> "-"
 
 module M = Map.Make (String)
 
@@ -71,6 +75,7 @@ module Closure = struct
     | Vint of int
     | Vtuple of value list
     | Vfun of (value list -> value)
+    | Vproxy of value ref
 
   let rec print_value ppf = function
     | Vint n ->
@@ -79,6 +84,8 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(%a)@]" print_values vl
     | Vfun _ ->
         Format.pp_print_string ppf "<fun>"
+    | Vproxy r ->
+        print_value ppf !r
 
   and print_values ppf = function
     | [] -> ()
@@ -98,7 +105,8 @@ module Closure = struct
         eval (M.add id (eval env e1) env) e2
     | Capply (id, idl) ->
         let f = match find id env with
-          | Vfun f -> f
+          | Vfun f
+          | Vproxy {contents = Vfun f} -> f
           | _ -> assert false
         in
         f (List.map (fun id -> find id env) idl)
@@ -116,20 +124,38 @@ module Closure = struct
           | _ -> assert false
         in
         Vint (n1 + n2)
+    | Cprimitive (Pmulint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 * n2)
+    | Cprimitive (Psubint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 - n2)
     | Cprimitive _ ->
         assert false
 
   let eval_program (Prog (funs, main)) =
     let env =
-      List.fold_left (fun env (name, args, _, body) ->
-          let f vl =
-            assert (List.length vl = List.length args);
-            let env = List.fold_left2 (fun env (id, _) v -> M.add id v env) env args vl in
-            eval env body
-          in
-          M.add name (Vfun f) env
-        ) M.empty funs
+      List.fold_left (fun env (name, _, _, _) -> M.add name (Vproxy (ref (Vint 0))) env)
+        M.empty funs
     in
+    List.iter (fun (name, args, _, body) ->
+        let f vl =
+          assert (List.length vl = List.length args);
+          let env = List.fold_left2 (fun env (id, _) v -> M.add id v env) env args vl in
+          eval env body
+        in
+        let r = match M.find name env with
+          | Vproxy r -> r
+          | _ -> assert false
+        in
+        r := Vfun f;
+      ) funs;
     eval env (Capply (main, []))
 
   let rec print ppf = function
@@ -202,6 +228,8 @@ module Low : sig
   val dump_module : t -> unit
   val insertion_block : t -> Llvm.llbasicblock
   val add : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
+  val mul : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
+  val sub : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
   val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
   val malloc : t -> int -> Llvm.llvalue
 end = struct
@@ -255,6 +283,8 @@ end = struct
   let dump_module c = Llvm.dump_module c.m
   let insertion_block c = Llvm.insertion_block c.b
   let add c v1 v2 = Llvm.build_add v1 v2 "" c.b
+  let mul c v1 v2 = Llvm.build_mul v1 v2 "" c.b
+  let sub c v1 v2 = Llvm.build_sub v1 v2 "" c.b
   let call c v vl = Llvm.build_call v (Array.of_list vl) "" c.b
   let malloc c n =
     let t = Llvm.function_type (ptr_type c) [| Llvm.i32_type c.c |] in
@@ -326,6 +356,14 @@ module Llvmgen = struct
         let v1, _ = find id1 env in
         let v2, _ = find id2 env in
         Low.add c v1 v2
+    | Cprimitive (Pmulint, [id1; id2]) ->
+        let v1, _ = find id1 env in
+        let v2, _ = find id2 env in
+        Low.mul c v1 v2
+    | Cprimitive (Psubint, [id1; id2]) ->
+        let v1, _ = find id1 env in
+        let v2, _ = find id2 env in
+        Low.sub c v1 v2
     | Cprimitive _ ->
         assert false
 
@@ -383,16 +421,32 @@ module Llvmgen = struct
     Low.dump_module c
 end
 
+(*
+
+Example: factorial
+
+(letrec
+   (fact (n int) (if n (\* n (fact (- n 1))) 1))
+   (fact1 () (fact 10))
+   (fact1))
+
+*)
+
 let () =
   let open Closure in
+  let fact =
+    Cifthenelse
+      ("n", Clet
+         ("c1", Int, Cint 1, Clet
+            ("x1", Int, Cprimitive (Psubint, ["n"; "c1"]), Clet
+               ("x2", Int, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
+       Cint 1)
+  in
+  let factn n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
   let prog =
     [
-      "test1", ["a", Int; "b", Int], Int,
-      Clet ("x1", Int, Cint 7,
-            Clet ("x2", Int, Cprimitive (Paddint, ["x1"; "b"]),
-                  Cprimitive (Paddint, ["a"; "x2"])));
-      "test", [], Int,
-      Clet ("x1", Int, Cint 3, Clet ("x2", Int, Cint 5, Capply ("test1", ["x1"; "x2"])))
+      "fact", ["n", Int], Int, fact;
+      "fact10", [], Int, factn 10
     ]
   in
-  Llvmgen.compile (Prog (prog, "test"))
+  Llvmgen.compile (Prog (prog, "fact10"))
