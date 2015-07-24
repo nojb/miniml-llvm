@@ -44,59 +44,67 @@ module Closure = struct
     | Prog of (string * (string * kind) list * kind * clambda) list * string
 end
 
-module Llvm = struct
-  module Low : sig
-    type t
-    val create : string -> t
-    val int : t -> int -> Llvm.llvalue
-    val load : t -> Llvm.llvalue -> Llvm.llvalue
-    val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
-    val inttoptr : t -> Llvm.llvalue -> Llvm.llvalue
-    val ret : t -> Llvm.llvalue -> unit
-    val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
-    val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
-    val position_at_end : t -> Llvm.llbasicblock -> unit
-    val lookup_global : t -> string -> Llvm.llvalue
-    val pointer_type : t -> Llvm.lltype
-    val int_type : t -> Llvm.lltype
-    val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
-    val dump_module : t -> unit
-  end = struct
-    type t =
-      { c : Llvm.llcontext;
-        b : Llvm.llbuilder;
-        m : Llvm.llmodule }
-    let create name =
-      let c = Llvm.create_context () in
-      let b = Llvm.builder c in
-      let m = Llvm.create_module c name in
-      { c; b; m }
-    let int c n = Llvm.const_int (Llvm.i32_type c.c) n
-    let load c v = Llvm.build_load v "" c.b
-    let gep c v vl = Llvm.build_gep v (Array.of_list vl) "" c.b
-    let inttoptr c v =
-      Llvm.build_inttoptr v (Llvm.pointer_type (Llvm.i32_type c.c)) "" c.b
-    let ret c v = ignore (Llvm.build_ret v c.b)
-    let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
-    let cond_br c v =
-      let f = Llvm.block_parent (Llvm.insertion_block c.b) in
-      let bb1 = Llvm.append_block c.c "" f in
-      let bb2 = Llvm.append_block c.c "" f in
-      ignore (Llvm.build_cond_br v bb1 bb2 c.b);
-      bb1, bb2
-    let position_at_end c bb =
-      Llvm.position_at_end bb c.b
-    let lookup_global c id =
-      match Llvm.lookup_global id c.m with
-      | None -> failwith "Low: global %S not found" id
-      | Some v -> v
-    let pointer_type c = Llvm.pointer_type (Llvm.i32_type c.c)
-    let int_type c = Llvm.i32_type c.c
-    let define_function c name atyps rtype =
-      Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
-    let dump_module c = Llvm.dump_module c.m
-  end
+module Low : sig
+  type t
+  val create : string -> t
+  val int : t -> int -> Llvm.llvalue
+  val load : t -> Llvm.llvalue -> Llvm.llvalue
+  val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
+  val inttoptr : t -> Llvm.llvalue -> Llvm.llvalue
+  val ret : t -> Llvm.llvalue -> unit
+  val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
+  val phi : t -> (Llvm.llvalue * Llvm.llbasicblock) list -> Llvm.llvalue
+  val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
+  val append_block : t -> Llvm.llbasicblock
+  val position_at_end : t -> Llvm.llbasicblock -> unit
+  val lookup_global : t -> string -> Llvm.llvalue
+  val pointer_type : t -> Llvm.lltype
+  val int_type : t -> Llvm.lltype
+  val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
+  val dump_module : t -> unit
+  val insertion_block : t -> Llvm.llbasicblock
+end = struct
+  type t =
+    { c : Llvm.llcontext;
+      b : Llvm.llbuilder;
+      m : Llvm.llmodule }
+  let create name =
+    let c = Llvm.create_context () in
+    let b = Llvm.builder c in
+    let m = Llvm.create_module c name in
+    { c; b; m }
+  let int c n = Llvm.const_int (Llvm.i32_type c.c) n
+  let load c v = Llvm.build_load v "" c.b
+  let gep c v vl = Llvm.build_gep v (Array.of_list vl) "" c.b
+  let inttoptr c v =
+    Llvm.build_inttoptr v (Llvm.pointer_type (Llvm.i32_type c.c)) "" c.b
+  let ret c v = ignore (Llvm.build_ret v c.b)
+  let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
+  let phi c l = Llvm.build_phi l "" c.b
+  let cond_br c v =
+    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
+    let bb1 = Llvm.append_block c.c "" f in
+    let bb2 = Llvm.append_block c.c "" f in
+    ignore (Llvm.build_cond_br v bb1 bb2 c.b);
+    bb1, bb2
+  let append_block c =
+    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
+    Llvm.append_block c.c "" f
+  let position_at_end c bb =
+    Llvm.position_at_end bb c.b
+  let lookup_global c id =
+    match Llvm.lookup_global id c.m with
+    | None -> failwith "Low: global %S not found" id
+    | Some v -> v
+  let pointer_type c = Llvm.pointer_type (Llvm.i32_type c.c)
+  let int_type c = Llvm.i32_type c.c
+  let define_function c name atyps rtype =
+    Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
+  let dump_module c = Llvm.dump_module c.m
+  let insertion_block c = Llvm.insertion_block c.b
+end
 
+module Llvmgen = struct
   open Closure
 
   module M = Map.Make (String)
@@ -122,7 +130,18 @@ module Llvm = struct
             v
         end
     | Cifthenelse (id, e1, e2) ->
-        assert false
+        let v, _ = find id env in
+        let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
+        let bb1, bb2 = Low.cond_br c v in
+        Low.position_at_end c bb1;
+        let v1 = compile c env e1 in
+        let bb1 = Low.insertion_block c in
+        Low.position_at_end c bb2;
+        let v2 = compile c env e2 in
+        let b2 = Low.insertion_block c in
+        let bb = Low.append_block c in
+        Low.position_at_end c bb;
+        Low.phi c [v1, bb1; v2, bb2]
     | Clet (id, Int, e1, e2) ->
         compile c (M.add id (compile c env e1, Int) env) e2
     | Cprimitive (Pmakeblock, idl) ->
@@ -176,4 +195,4 @@ let () =
       "test", [], Int, Closure.Cint 0
     ]
   in
-  Llvm.compile (Prog (prog, ""))
+  Llvmgen.compile (Prog (prog, ""))
