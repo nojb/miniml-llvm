@@ -39,6 +39,11 @@ let string_of_primitive = function
   | Pgetfield i -> Printf.sprintf "getfield %d" i
   | Paddint -> "+"
 
+module M = Map.Make (String)
+
+let find id env =
+  try M.find id env with Not_found -> failwith "find: %S not found" id
+
 module Knf = struct
   type knf =
     | Kint of int
@@ -61,6 +66,58 @@ module Closure = struct
     | Cprimitive of primitive * string list
   type program =
     | Prog of (string * (string * kind) list * kind * clambda) list * string
+
+  type value =
+    | Vint of int
+    | Vtuple of value list
+    | Vfun of (value list -> value)
+
+  let rec eval env = function
+    | Cint n -> Vint n
+    | Clabel id | Cvar id -> find id env
+    | Cifthenelse (id, e1, e2) ->
+        let n = match find id env with
+          | Vint n -> n
+          | _ -> assert false
+        in
+        if n = 0 then eval env e2 else eval env e1
+    | Clet (id, _, e1, e2) ->
+        eval (M.add id (eval env e1) env) e2
+    | Capply (id, idl) ->
+        let f = match find id env with
+          | Vfun f -> f
+          | _ -> assert false
+        in
+        f (List.map (fun id -> find id env) idl)
+    | Cprimitive (Pmakeblock, idl) ->
+        Vtuple (List.map (fun id -> find id env) idl)
+    | Cprimitive (Pgetfield i, [id]) ->
+        let l = match find id env with
+          | Vtuple l ->  l
+          | _ -> assert false
+        in
+        List.nth l i
+    | Cprimitive (Paddint, [id1; id2]) ->
+        let n1, n2 = match find id1 env, find id2 env with
+          | Vint n1, Vint n2 -> n1, n2
+          | _ -> assert false
+        in
+        Vint (n1 + n2)
+    | Cprimitive _ ->
+        assert false
+
+  let eval_program (Prog (funs, main)) =
+    let env =
+      List.fold_left (fun env (name, args, _, body) ->
+          let f vl =
+            assert (List.length vl = List.length args);
+            let env = List.fold_left2 (fun env (id, _) v -> M.add id v env) env args vl in
+            eval env body
+          in
+          M.add name (Vfun f) env
+        ) M.empty funs
+    in
+    eval env (Capply (main, []))
 
   let rec print ppf = function
     | Cint n ->
@@ -190,11 +247,6 @@ end
 
 module Llvmgen = struct
   open Closure
-
-  module M = Map.Make (String)
-
-  let find id env =
-    try M.find id env with Not_found -> failwith "Llvmgen.find: %S not found" id
 
   let toptr c id env =
     match find id env with
