@@ -51,6 +51,9 @@ module Llvm = struct
     val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
     val inttoptr : t -> Llvm.llvalue -> Llvm.llvalue
     val ret : t -> Llvm.llvalue -> unit
+    val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
+    val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
+    val position_at_end : t -> Llvm.llbasicblock -> unit
     val lookup_global : t -> string -> Llvm.llvalue
   end = struct
     type t =
@@ -68,6 +71,15 @@ module Llvm = struct
     let inttoptr c v =
       Llvm.build_inttoptr v (Llvm.pointer_type (Llvm.i32_type c.c)) "" c.b
     let ret c v = ignore (Llvm.build_ret v c.b)
+    let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
+    let cond_br c v =
+      let f = Llvm.block_parent (Llvm.insertion_block c.b) in
+      let bb1 = Llvm.append_block c.c "" f in
+      let bb2 = Llvm.append_block c.c "" f in
+      ignore (Llvm.build_cond_br v bb1 bb2 c.b);
+      bb1, bb2
+    let position_at_end c bb =
+      Llvm.position_at_end bb c.b
     let lookup_global c id =
       match Llvm.lookup_global id c.m with
       | None -> failwith "Low: global %S not found" id
@@ -98,6 +110,8 @@ module Llvm = struct
         | (Int, v) ->
             v
         end
+    | Cifthenelse (id, e1, e2) ->
+        assert false
     | Clet (id, Int, e1, e2) ->
         compile c (M.add id (Int, compile c env e1) env) e2
     | Cprimitive (Pmakeblock, idl) ->
@@ -108,8 +122,16 @@ module Llvm = struct
         Low.gep c v [Low.int c i]
 
   and compile_tail c env = function
-    | Cint _ | Cprimitive _ as e ->
+    | Cint _ | Cvar _ | Cprimitive _ as e ->
         Low.ret c (compile c env e)
+    | Cifthenelse (id, e1, e2) ->
+        let v = match find id env with (Int, v) -> v | (Ptr, _) -> assert false in
+        let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
+        let bb1, bb2 = Low.cond_br c v in
+        Low.position_at_end c bb1;
+        compile_tail c env e1;
+        Low.position_at_end c bb2;
+        compile_tail c env e2
     | Clet (id, Int, e1, e2) ->
         compile_tail c (M.add id (Int, compile c env e1) env) e2
 end
