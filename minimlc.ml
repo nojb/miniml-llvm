@@ -200,11 +200,19 @@ module Closure = struct
 
   open Knf
 
+  let all_funs : (string * (string * kind) * kind * clambda) list ref = ref []
+
   let rec transl env = function
     | Kint n ->
         Cint n
+    | Kvar id ->
+        Cvar id
+    | Kifthenelse (id, e1, e2) ->
+        Cifthenelse (id, transl env e1, transl env e2)
     | Klet (id, k, e1, e2) ->
         Clet (id, k, transl env e1, transl (M.add id k env) e2)
+    | Kletrec (funs, e) ->
+        assert false
     | Kapply (id, k, idl) ->
         let tmp1 = gentmp () in
         let tmp2 = gentmp () in
@@ -212,8 +220,13 @@ module Closure = struct
           (tmp1, Int, Cprimitive (Pgetfield 0, [id]), Clet
              (tmp2, Ptr, Cprimitive (Pgetfield 1, [id]), Capply
                 (tmp1, k, tmp2 :: idl)))
-    | _ ->
-        failwith "Closure.compile: not implemented"
+    | Kprimitive (prim, idl) ->
+        Cprimitive (prim, idl)
+
+  let transl_program e =
+    all_funs := [];
+    let e = transl e in
+    !all_funs, e
 end
 
 module Low : sig
