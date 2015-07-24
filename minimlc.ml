@@ -19,6 +19,8 @@
    IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. *)
 
+let failwith = Printf.ksprintf failwith
+
 type primitive =
   | Pmakeblock
   | Pgetfield of int
@@ -42,12 +44,38 @@ end
 
 module Llvm = struct
   module Low : sig
-    type t =
-      { builder : Llvm.llbuilder;
-        context : Llvm.llcontext }
+    type t
+    val int : t -> int -> Llvm.llvalue
+    val load : t -> Llvm.llvalue -> Llvm.llvalue
+    val lookup_global : t -> string -> Llvm.llvalue
   end = struct
     type t =
-      { builder : Llvm.llbuilder;
-        context : Llvm.llcontext }
+      { b : Llvm.llbuilder;
+        c : Llvm.llcontext;
+        m : Llvm.llmodule }
+
+    let int c n = Llvm.const_int (Llvm.i32_type c.c) n
+    let load c v = Llvm.build_load v "" c.b
+    let lookup_global c id =
+      match Llvm.lookup_global id c.m with
+      | None -> failwith "Low: global %S not found" id
+      | Some v -> v
   end
+
+  open Closure
+
+  module M = Map.Make (String)
+
+  let compile c env = function
+    | Cint n ->
+        Low.int c n
+    | Clabel id ->
+        Low.lookup_global c id
+    | Cvar id ->
+        begin match M.find id env with
+        | (Ptr, v) ->
+            Low.load c v
+        | (Int, v) ->
+            v
+        end
 end
