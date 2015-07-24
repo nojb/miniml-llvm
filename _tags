@@ -1,2 +1,3 @@
-true: package(llvm)
+true: package(llvm), package(llvm.executionengine)
+true: package(ctypes)
 true: bin_annot

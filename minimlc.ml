@@ -232,6 +232,7 @@ module Low : sig
   val sub : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
   val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
   val malloc : t -> int -> Llvm.llvalue
+  val llmodule : t -> Llvm.llmodule
 end = struct
   type t =
     { c : Llvm.llcontext;
@@ -290,6 +291,7 @@ end = struct
     let t = Llvm.function_type (ptr_type c) [| Llvm.i32_type c.c |] in
     let f = Llvm.declare_function "malloc" t c.m in
     Llvm.build_call f [| Llvm.const_int (Llvm.i32_type c.c) (n * Sys.word_size / 8) |] "" c.b
+  let llmodule c = c.m
 end
 
 module Llvmgen = struct
@@ -418,7 +420,8 @@ module Llvmgen = struct
         Low.position_at_end c (Llvm.entry_block f);
         compile_tail c env body
       ) funs;
-    Low.dump_module c
+    Low.dump_module c;
+    Low.llmodule c
 end
 
 (*
@@ -432,7 +435,7 @@ Example: factorial
 
 *)
 
-let () =
+let fact n =
   let open Closure in
   let fact =
     Cifthenelse
@@ -446,7 +449,22 @@ let () =
   let prog =
     [
       "fact", ["n", Int], Int, fact;
-      "fact10", [], Int, factn 10
+      "factn", [], Int, factn n
     ]
   in
-  Llvmgen.compile (Prog (prog, "fact10"))
+  let m = Llvmgen.compile (Prog (prog, "factn")) in
+  if not (Llvm_executionengine.initialize ()) then
+    failwith "Execution engine could not be initialized";
+  let ee = Llvm_executionengine.create m in
+  let f =
+    Llvm_executionengine.get_function_address "factn"
+      Ctypes.(Foreign.funptr (void @-> returning int)) ee
+  in
+  let n = f () in
+  let c = Llvm.module_context m in
+  Llvm_executionengine.dispose ee;
+  Llvm.dispose_context c;
+  n
+
+let () =
+  Printf.printf "fact (10) = %d\n%!" (fact 10)
