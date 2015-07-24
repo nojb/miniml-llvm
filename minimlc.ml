@@ -40,6 +40,8 @@ module Closure = struct
     | Clet of string * kind * clambda * clambda
     | Capply of string * string list
     | Cprimitive of primitive * string list
+  type program =
+    | Prog of (string * (string * kind) list * kind * clambda) list * string
 end
 
 module Llvm = struct
@@ -55,6 +57,10 @@ module Llvm = struct
     val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
     val position_at_end : t -> Llvm.llbasicblock -> unit
     val lookup_global : t -> string -> Llvm.llvalue
+    val pointer_type : t -> Llvm.lltype
+    val int_type : t -> Llvm.lltype
+    val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
+    val dump_module : t -> unit
   end = struct
     type t =
       { c : Llvm.llcontext;
@@ -84,6 +90,11 @@ module Llvm = struct
       match Llvm.lookup_global id c.m with
       | None -> failwith "Low: global %S not found" id
       | Some v -> v
+    let pointer_type c = Llvm.pointer_type (Llvm.i32_type c.c)
+    let int_type c = Llvm.i32_type c.c
+    let define_function c name atyps rtype =
+      Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
+    let dump_module c = Llvm.dump_module c.m
   end
 
   open Closure
@@ -95,8 +106,8 @@ module Llvm = struct
 
   let toptr c id env =
     match find id env with
-    | (Ptr, v) -> v
-    | (Int, v) -> Low.inttoptr c v
+    | (v, Ptr) -> v
+    | (v, Int) -> Low.inttoptr c v
 
   let rec compile c env = function
     | Cint n ->
@@ -105,15 +116,15 @@ module Llvm = struct
         Low.lookup_global c id
     | Cvar id ->
         begin match find id env with
-        | (Ptr, v) ->
+        | (v, Ptr) ->
             Low.load c v
-        | (Int, v) ->
+        | (v, Int) ->
             v
         end
     | Cifthenelse (id, e1, e2) ->
         assert false
     | Clet (id, Int, e1, e2) ->
-        compile c (M.add id (Int, compile c env e1) env) e2
+        compile c (M.add id (compile c env e1, Int) env) e2
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> find id env) idl in
         assert false
@@ -125,7 +136,7 @@ module Llvm = struct
     | Cint _ | Cvar _ | Cprimitive _ as e ->
         Low.ret c (compile c env e)
     | Cifthenelse (id, e1, e2) ->
-        let v = match find id env with (Int, v) -> v | (Ptr, _) -> assert false in
+        let v, _ = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
@@ -133,5 +144,24 @@ module Llvm = struct
         Low.position_at_end c bb2;
         compile_tail c env e2
     | Clet (id, Int, e1, e2) ->
-        compile_tail c (M.add id (Int, compile c env e1) env) e2
+        compile_tail c (M.add id (compile c env e1, Int) env) e2
+
+  let compile (Prog (funs, main)) =
+    let c = Low.create "miniml" in
+    let env =
+      List.fold_left (fun env (name, args, ret, _) ->
+          let atyps =
+            List.map (function (_, Ptr) -> Low.pointer_type c | (_, Int) -> Low.int_type c) args
+          in
+          let rtype = match ret with Ptr -> Low.pointer_type c | Int -> Low.int_type c in
+          let f = Low.define_function c name atyps rtype in
+          M.add name (f, Int) env
+        ) M.empty funs
+    in
+    List.iter (fun (name, args, _, body) ->
+        let (f, _) = find name env in
+        Low.position_at_end c (Llvm.entry_block f);
+        compile_tail c env body
+      ) funs;
+    Low.dump_module c
 end
