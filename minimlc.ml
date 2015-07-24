@@ -63,10 +63,12 @@ module Low : sig
   val append_block : t -> Llvm.llbasicblock
   val position_at_end : t -> Llvm.llbasicblock -> unit
   val entry_block : t -> Llvm.llbasicblock
-  val lookup_global : t -> string -> Llvm.llvalue
+  val lookup_function : t -> string -> Llvm.llvalue
   val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
   val dump_module : t -> unit
   val insertion_block : t -> Llvm.llbasicblock
+  val add : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
+  val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
 end = struct
   type t =
     { c : Llvm.llcontext;
@@ -109,14 +111,16 @@ end = struct
   let entry_block c =
     let f = Llvm.block_parent (Llvm.insertion_block c.b) in
     Llvm.entry_block f
-  let lookup_global c id =
-    match Llvm.lookup_global id c.m with
-    | None -> failwith "Low: global %S not found" id
+  let lookup_function c id =
+    match Llvm.lookup_function id c.m with
+    | None -> failwith "Low: function %S not found" id
     | Some v -> v
   let define_function c name atyps rtype =
     Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
   let dump_module c = Llvm.dump_module c.m
   let insertion_block c = Llvm.insertion_block c.b
+  let add c v1 v2 = Llvm.build_add v1 v2 "" c.b
+  let call c v vl = Llvm.build_call v (Array.of_list vl) "" c.b
 end
 
 module Llvmgen = struct
@@ -136,7 +140,7 @@ module Llvmgen = struct
     | Cint n ->
         Low.int c n
     | Clabel id ->
-        Low.lookup_global c id
+        Low.lookup_function c id
     | Cvar id ->
         begin match find id env with
         | (v, Ptr) -> Low.load c v
@@ -151,7 +155,7 @@ module Llvmgen = struct
         let bb1 = Low.insertion_block c in
         Low.position_at_end c bb2;
         let v2 = compile c env e2 in
-        let b2 = Low.insertion_block c in
+        let bb2 = Low.insertion_block c in
         let bb = Low.append_block c in
         Low.position_at_end c bb;
         Low.phi c [v1, bb1; v2, bb2]
@@ -173,9 +177,17 @@ module Llvmgen = struct
     | Cprimitive (Pgetfield i, [id]) ->
         let v = toptr c id env in
         Low.gep c v [Low.int c i]
+    | Cprimitive (Paddint, [id1; id2]) ->
+        let v1, _ = find id1 env in
+        let v2, _ = find id2 env in
+        Low.add c v1 v2
+    | Capply (id, idl) ->
+        let v = Low.lookup_function c id in
+        let vl = List.map (fun id -> fst (find id env)) idl in
+        Low.call c v vl
 
   and compile_tail c env = function
-    | Cint _ | Cvar _ | Cprimitive _ as e ->
+    | Cint _ | Cvar _ | Cprimitive _ as e -> (* TODO tail call *)
         Low.ret c (compile c env e)
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
@@ -192,6 +204,10 @@ module Llvmgen = struct
         let a = Low.alloca c (Low.ptr_type c) in
         Low.store c v a;
         compile_tail c (M.add id (a, Ptr) env) e2
+    | Capply _ as e ->
+        let v = compile c env e in
+        Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
+        Low.ret c v
 
   let compile (Prog (funs, main)) =
     let c = Low.create "miniml" in
@@ -202,6 +218,7 @@ module Llvmgen = struct
           in
           let rtype = match ret with Ptr -> Low.ptr_type c | Int -> Low.int_type c in
           let f = Low.define_function c name atyps rtype in
+          Llvm.set_function_call_conv Llvm.CallConv.fast f;
           M.add name (f, Int) env
         ) M.empty funs
     in
