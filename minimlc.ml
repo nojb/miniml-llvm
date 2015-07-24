@@ -160,8 +160,20 @@ module Llvm = struct
     in
     List.iter (fun (name, args, _, body) ->
         let (f, _) = find name env in
+        let params = Array.to_list (Llvm.params f) in
+        let env =
+          List.fold_left2 (fun env (id, k) v -> M.add id (v, k) env) env args params
+        in
         Low.position_at_end c (Llvm.entry_block f);
         compile_tail c env body
       ) funs;
     Low.dump_module c
 end
+
+let () =
+  let prog =
+    [
+      "test", [], Int, Closure.Cint 0
+    ]
+  in
+  Llvm.compile (Prog (prog, ""))
