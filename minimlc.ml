@@ -72,6 +72,19 @@ module Closure = struct
     | Vtuple of value list
     | Vfun of (value list -> value)
 
+  let rec print_value ppf = function
+    | Vint n ->
+        Format.pp_print_int ppf n
+    | Vtuple vl ->
+        Format.fprintf ppf "@[<2>(%a)@]" print_values vl
+    | Vfun _ ->
+        Format.pp_print_string ppf "<fun>"
+
+  and print_values ppf = function
+    | [] -> ()
+    | v :: [] -> print_value ppf v
+    | v :: vl -> Format.fprintf ppf "%a@ %a" print_value v print_values vl
+
   let rec eval env = function
     | Cint n -> Vint n
     | Clabel id | Cvar id -> find id env
@@ -146,14 +159,18 @@ module Closure = struct
     | (x, k) :: xs ->
         Format.fprintf ppf "%s %s@ %a" x (string_of_kind k) print_params xs
 
+  let print_fun ppf (name, params, _, body) =
+    Format.fprintf ppf "@[<2>(%s@ (%a)@ %a)@]" name print_params params print body
+
   let rec print_funs ppf = function
     | [] -> ()
-    | (name, params, _, body) :: funs ->
-        Format.fprintf ppf "@ @[<2>(%s@ (%a)@ %a)@ %a@]"
-          name print_params params print body print_funs funs
+    | f :: [] ->
+        print_fun ppf f
+    | f :: funs ->
+        Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
 
   let print_program ppf (Prog (funs, main)) =
-    Format.fprintf ppf "@[<2>(letrec%a(%s))@]" print_funs funs main
+    Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@,(%s)@])@]" print_funs funs main
 
   open Knf
 
@@ -337,6 +354,7 @@ module Llvmgen = struct
 
   let compile (Prog (funs, main) as prog) =
     Format.printf "@[Compiling...@\n%a@]@." print_program prog;
+    Format.printf "@[Running...%a\n@]@." print_value (eval_program prog);
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
@@ -368,10 +386,12 @@ let () =
   let open Closure in
   let prog =
     [
-      "test", ["a", Int; "b", Int], Int,
+      "test1", ["a", Int; "b", Int], Int,
       Clet ("x1", Int, Cint 7,
             Clet ("x2", Int, Cprimitive (Paddint, ["x1"; "b"]),
-                  Cprimitive (Paddint, ["a"; "x2"])))
+                  Cprimitive (Paddint, ["a"; "x2"])));
+      "test", [], Int,
+      Clet ("x1", Int, Cint 3, Clet ("x2", Int, Cint 5, Capply ("test1", ["x1"; "x2"])))
     ]
   in
   Llvmgen.compile (Prog (prog, "test"))
