@@ -38,7 +38,7 @@ let string_of_kind = function
 
 let string_of_primitive = function
   | Pmakeblock -> "makeblock"
-  | Pgetfield i -> Printf.sprintf "getfield %d" i
+  | Pgetfield i -> Printf.sprintf "#%d" i
   | Paddint -> "+"
   | Pmulint -> "*"
   | Psubint -> "-"
@@ -60,7 +60,7 @@ module Knf = struct
     | Kifthenelse of string * knf * knf
     | Klet of string * kind * knf * knf
     | Kletrec of (string * (string * kind) list * kind * knf) list * knf
-    | Kapply of string * kind * string list
+    | Kapply of string * string list
     | Kprimitive of primitive * string list
 
   type value =
@@ -110,7 +110,7 @@ module Knf = struct
             r := f;
           ) funs;
         eval env e
-    | Kapply (id, _, idl) ->
+    | Kapply (id, idl) ->
         let f = match find id env with
           | Vfun r -> !r
           | _ -> assert false
@@ -156,7 +156,7 @@ module Knf = struct
         Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
     | Kletrec (funs, e) ->
         Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ %a@])@]" print_funs funs print e
-    | Kapply (id, _, idl) ->
+    | Kapply (id, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Kprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
@@ -192,7 +192,7 @@ module Knf = struct
           List.fold_left (fun s (id, _, _, _) -> S.remove id s) (fv e) funs
         in
         List.fold_left S.union fve (List.map fv_fun funs)
-    | Kapply (id, _, idl) ->
+    | Kapply (id, idl) ->
         List.fold_left (fun s id -> S.add id s) S.empty (id :: idl) (* check id *)
     | Kprimitive (_, idl) ->
         List.fold_left (fun s id -> S.add id s) S.empty idl
@@ -208,7 +208,7 @@ module Closure = struct
     | Cvar of string
     | Cifthenelse of string * clambda * clambda
     | Clet of string * kind * clambda * clambda
-    | Capply of string * kind * string list
+    | Capply of string * string list
     | Cprimitive of primitive * string list
   type program =
     | Prog of (string * (string * kind) list * kind * clambda) list * clambda
@@ -242,7 +242,7 @@ module Closure = struct
         if n = 0 then eval env e2 else eval env e1
     | Clet (id, _, e1, e2) ->
         eval (M.add id (eval env e1) env) e2
-    | Capply (id, _, idl) ->
+    | Capply (id, idl) ->
         let f = match find id env with
           | Vfun r -> !r
           | _ -> assert false
@@ -307,7 +307,7 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
     | Clet (id, k, e1, e2) ->
         Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
-    | Capply (id, _, idl) ->
+    | Capply (id, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Cprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
@@ -366,20 +366,21 @@ module Closure = struct
                   Clet (fv, find fv env, Cprimitive (Pgetfield n, [clos]), e)
                 ) fvs (transl (List.fold_left (fun env (id, k) -> M.add id k env) env args) body)
             in
+            (* FIXME fv from sibling functions are not in env *)
             all_funs := (id, (clos, Ptr) :: args, k, body) :: !all_funs;
             let ff = gentmp () in
             Clet
               (clos, Ptr, Cprimitive (Pmakeblock, fvs), Clet
                  (ff, Int, Clabel id, Clet
-                    (ff, Ptr, Cprimitive (Pmakeblock, [ff; clos]), e)))
+                    (id, Ptr, Cprimitive (Pmakeblock, [ff; clos]), e)))
           ) funs (transl env e)
-    | Kapply (id, k, idl) ->
+    | Kapply (id, idl) ->
         let tmp1 = gentmp () in
         let tmp2 = gentmp () in
         Clet
           (tmp1, Int, Cprimitive (Pgetfield 0, [id]), Clet
              (tmp2, Ptr, Cprimitive (Pgetfield 1, [id]), Capply
-                (tmp1, k, tmp2 :: idl)))
+                (tmp1, tmp2 :: idl)))
     | Kprimitive (prim, idl) ->
         Cprimitive (prim, idl)
 
@@ -418,6 +419,7 @@ module Low : sig
   val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
   val malloc : t -> int -> Llvm.llvalue
   val llmodule : t -> Llvm.llmodule
+  val pointercast : t -> Llvm.llvalue -> Llvm.lltype -> Llvm.llvalue
 end = struct
   type t =
     { c : Llvm.llcontext;
@@ -477,6 +479,7 @@ end = struct
     let f = Llvm.declare_function "malloc" t c.m in
     Llvm.build_call f [| Llvm.const_int (Llvm.i32_type c.c) (n * Sys.word_size / 8) |] "" c.b
   let llmodule c = c.m
+  let pointercast c v t = Llvm.build_pointercast v t "" c.b
 end
 
 module Llvmgen = struct
@@ -496,14 +499,22 @@ module Llvmgen = struct
     | Ptr -> Low.ptr_type c
     | Int -> Low.int_type c
 
-  let rec compile c env = function
+  let cast c k v =
+    match Llvm.classify_type (Llvm.type_of v), k with
+    | Llvm.TypeKind.Pointer, Ptr
+    | Llvm.TypeKind.Integer, Int -> v
+    | Llvm.TypeKind.Pointer, Int -> Low.ptrtoint c v
+    | Llvm.TypeKind.Integer, Ptr -> Low.inttoptr c v (Low.ptr_type c)
+    | _ -> assert false
+
+  let rec compile c env k = function
     | Cint n ->
         Low.int c n
     | Clabel id ->
         Low.ptrtoint c (Low.lookup_function c id)
     | Cvar id ->
         begin match find id env with
-        | (v, Ptr) -> Low.load c v
+        | (v, Ptr) -> Low.inttoptr c (Low.load c v) (Low.ptr_type c)
         | (v, Int) -> v
         end
     | Cifthenelse (id, e1, e2) ->
@@ -511,42 +522,45 @@ module Llvmgen = struct
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
-        let v1 = compile c env e1 in
+        let v1 = compile c env k e1 in
         let bb1 = Low.insertion_block c in
         Low.position_at_end c bb2;
-        let v2 = compile c env e2 in
+        let v2 = compile c env k e2 in
         let bb2 = Low.insertion_block c in
         let bb = Low.append_block c in
         Low.position_at_end c bb;
         Low.phi c [v1, bb1; v2, bb2]
     | Clet (id, Int, e1, e2) ->
-        compile c (M.add id (compile c env e1, Int) env) e2
+        compile c (M.add id (compile c env Int e1, Int) env) k e2
     | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env e1 in
+        let v = compile c env Ptr e1 in
         let bb = Low.insertion_block c in
         Low.position_at_end c (Low.entry_block c);
         let a = Low.alloca c (Low.ptr_type c) in
         Low.position_at_end c bb;
         Low.store c v a;
-        let v = compile c (M.add id (a, Ptr) env) e2 in
+        let a' = Low.pointercast c a (Low.ptr_type c) in
+        let v = compile c (M.add id (a', Ptr) env) k e2 in
         Low.store c (Llvm.const_null (Low.ptr_type c)) a;
         v
-    | Capply (id, k, idl) ->
+    | Capply (id, idl) ->
         let v, _ = find id env in
         let vl, atyps = List.split (List.map (fun id -> find id env) idl) in
         let atyps = List.map (lltype c) atyps in
         let rtype = lltype c k in
         let t = Llvm.function_type rtype (Array.of_list atyps) in
         let v = Low.inttoptr c v (Llvm.pointer_type t) in
-        Low.call c v vl
+        let v = Low.call c v vl in
+        Low.dump_module c;
+        v
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> toint c id env) idl in
         let v = Low.malloc c (List.length idl) in
-        List.iteri (fun i v -> Low.store c v (Low.gep c v [Low.int c i])) vl;
-        v
+        List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
+        cast c k v
     | Cprimitive (Pgetfield i, [id]) ->
         let v = toptr c id env in
-        Low.gep c v [Low.int c i]
+        cast c k (Low.load c (Low.gep c v [Low.int c i]))
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1, _ = find id1 env in
         let v2, _ = find id2 env in
@@ -562,26 +576,27 @@ module Llvmgen = struct
     | Cprimitive _ ->
         assert false
 
-  and compile_tail c env = function
+  and compile_tail c env k = function
     | Cint _ | Cvar _ | Cprimitive _ | Clabel _ as e -> (* TODO tail call *)
-        Low.ret c (compile c env e)
+        Low.ret c (compile c env k e)
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
-        compile_tail c env e1;
+        compile_tail c env k e1;
         Low.position_at_end c bb2;
-        compile_tail c env e2
+        compile_tail c env k e2
     | Clet (id, Int, e1, e2) ->
-        compile_tail c (M.add id (compile c env e1, Int) env) e2
+        compile_tail c (M.add id (compile c env Int e1, Int) env) k e2
     | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env e1 in
+        let v = compile c env Ptr e1 in
         let a = Low.alloca c (Low.ptr_type c) in
         Low.store c v a;
-        compile_tail c (M.add id (a, Ptr) env) e2
+        let a = Low.pointercast c a (Low.ptr_type c) in
+        compile_tail c (M.add id (a, Ptr) env) k e2
     | Capply _ as e ->
-        let v = compile c env e in
+        let v = compile c env k e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         Low.ret c v
@@ -597,7 +612,7 @@ module Llvmgen = struct
           M.add name (f, Int) env
         ) M.empty funs
     in
-    List.iter (fun (name, args, _, body) ->
+    List.iter (fun (name, args, k, body) ->
         let (f, _) = find name env in
         let params = Array.to_list (Llvm.params f) in
         let env =
@@ -607,11 +622,11 @@ module Llvmgen = struct
             ) env args params
         in
         Low.position_at_end c (Llvm.entry_block f);
-        compile_tail c env body
+        compile_tail c env k body
       ) funs;
     let mainf = Low.define_function c "main" [] (Low.int_type c) in
     Low.position_at_end c (Llvm.entry_block mainf);
-    compile_tail c env main;
+    compile_tail c env Int main;
     Low.dump_module c;
     Low.llmodule c
 end
@@ -625,7 +640,35 @@ Example: factorial
    (fact1 () (fact 10))
    (fact1))
 
+let rec adder n =
+  let rec aux m = n + m in aux
+in
+(adder 3) 5
+
 *)
+
+let adder =
+  let open Knf in
+  Kletrec (["adder", ["n", Int], Ptr, Kletrec (["aux", ["m", Int], Int, Kprimitive (Paddint, ["n"; "m"])], Kvar "aux")], Klet ("a", Int, Kint 3, Klet ("x", Ptr, Kapply ("adder", ["a"]), Klet ("y", Int, Kint 5, Kapply ("x", ["y"])))))
+
+let run prog =
+  Format.printf "%a@.@\n" Knf.print adder;
+  let prog = Closure.transl_program prog in
+  Format.printf "%a@.@\n" Closure.print_program prog;
+  let m = Llvmgen.compile prog in
+  Llvm.dump_module m;
+  if not (Llvm_executionengine.initialize ()) then
+    failwith "Execution engine could not be initialized";
+  let ee = Llvm_executionengine.create m in
+  let f =
+    Llvm_executionengine.get_function_address "main"
+      Ctypes.(Foreign.funptr (void @-> returning int)) ee
+  in
+  let n = f () in
+  let c = Llvm.module_context m in
+  Llvm_executionengine.dispose ee;
+  Llvm.dispose_context c;
+  n
 
 let fact n =
   let open Closure in
@@ -634,7 +677,7 @@ let fact n =
       ("n", Clet
          ("c1", Int, Cint 1, Clet
             ("x1", Int, Cprimitive (Psubint, ["n"; "c1"]), Clet
-               ("x2", Int, Capply ("fact", Int, ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
+               ("x2", Int, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
        Cint 1)
   in
   let prog =
@@ -642,9 +685,15 @@ let fact n =
       "fact", ["n", Int], Int, fact;
     ]
   in
-  let main n = Clet ("x", Int, Cint n, Capply ("fact", Int, ["x"])) in
-  let prog = Prog (prog, main n) in
-  Format.printf "@[%a@]@." print_program prog;
+  let main n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
+  Prog (prog, main n)
+
+let () =
+  Printf.printf "Result: %d\n%!" (run adder)
+  (* run (fact 10) *)
+
+(*
+    Format.printf "@[%a@]@." print_program prog;
   Format.printf "@[%a\n@]@." print_value (eval_program prog);
   let m = Llvmgen.compile prog in
   if not (Llvm_executionengine.initialize ()) then
@@ -662,3 +711,4 @@ let fact n =
 
 let () =
   Printf.printf "fact (10) = %d\n%!" (fact 10)
+*)
