@@ -83,10 +83,12 @@ end = struct
     | 64 -> Llvm.i64_type c.c
     | _ -> assert false
   let ptr_type c = Llvm.pointer_type (int_type c)
-  let int c n = Llvm.const_int (Llvm.i32_type c.c) n
+  let int c n = Llvm.const_int (int_type c) n
   let load c v = Llvm.build_load v "" c.b
   let store c v p = ignore (Llvm.build_store v p c.b)
-  let gep c v vl = Llvm.build_gep v (Array.of_list vl) "" c.b
+  let gep c v vl =
+    let vl = List.map (fun v -> Llvm.build_trunc v (Llvm.i32_type c.c) "" c.b) vl in
+    Llvm.build_gep v (Array.of_list vl) "" c.b
   let inttoptr c v = Llvm.build_inttoptr v (ptr_type c) "" c.b
   let ptrtoint c v = Llvm.build_ptrtoint v (int_type c) "" c.b
   let ret c v = ignore (Llvm.build_ret v c.b)
