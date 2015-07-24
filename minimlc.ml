@@ -406,6 +406,7 @@ module Low : sig
   val phi : t -> (Llvm.llvalue * Llvm.llbasicblock) list -> Llvm.llvalue
   val alloca : t -> Llvm.lltype -> Llvm.llvalue
   val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
+  val br : t -> Llvm.llbasicblock -> unit
   val append_block : t -> Llvm.llbasicblock
   val position_at_end : t -> Llvm.llbasicblock -> unit
   val entry_block : t -> Llvm.llbasicblock
@@ -447,13 +448,18 @@ end = struct
   let ret c v = ignore (Llvm.build_ret v c.b)
   let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
   let phi c l = Llvm.build_phi l "" c.b
-  let alloca c t = Llvm.build_alloca t "" c.b
+  let alloca c t =
+    let b =
+      Llvm.builder_at_end c.c (Llvm.entry_block (Llvm.block_parent (Llvm.insertion_block c.b)))
+    in
+    Llvm.build_alloca t "" b
   let cond_br c v =
     let f = Llvm.block_parent (Llvm.insertion_block c.b) in
     let bb1 = Llvm.append_block c.c "" f in
     let bb2 = Llvm.append_block c.c "" f in
     ignore (Llvm.build_cond_br v bb1 bb2 c.b);
     bb1, bb2
+  let br c bb = ignore (Llvm.build_br bb c.b)
   let append_block c =
     let f = Llvm.block_parent (Llvm.insertion_block c.b) in
     Llvm.append_block c.c "" f
@@ -534,10 +540,7 @@ module Llvmgen = struct
         compile c (M.add id (compile c env Int e1, Int) env) k e2
     | Clet (id, Ptr, e1, e2) ->
         let v = compile c env Ptr e1 in
-        let bb = Low.insertion_block c in
-        Low.position_at_end c (Low.entry_block c);
         let a = Low.alloca c (Low.ptr_type c) in
-        Low.position_at_end c bb;
         Low.store c v a;
         let a' = Low.pointercast c a (Low.ptr_type c) in
         let v = compile c (M.add id (a', Ptr) env) k e2 in
@@ -622,11 +625,19 @@ module Llvmgen = struct
             ) env args params
         in
         Low.position_at_end c (Llvm.entry_block f);
-        compile_tail c env k body
+        let bb = Low.append_block c in
+        Low.position_at_end c bb;
+        compile_tail c env k body;
+        Low.position_at_end c (Llvm.entry_block f);
+        Low.br c bb
       ) funs;
     let mainf = Low.define_function c "main" [] (Low.int_type c) in
     Low.position_at_end c (Llvm.entry_block mainf);
+    let bb = Low.append_block c in
+    Low.position_at_end c bb;
     compile_tail c env Int main;
+    Low.position_at_end c (Llvm.entry_block mainf);
+    Low.br c bb;
     Low.dump_module c;
     Low.llmodule c
 end
