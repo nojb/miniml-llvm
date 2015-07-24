@@ -66,7 +66,7 @@ module Closure = struct
     | Cvar of string
     | Cifthenelse of string * clambda * clambda
     | Clet of string * kind * clambda * clambda
-    | Capply of string * string list
+    | Capply of string * kind * string list
     | Cprimitive of primitive * string list
   type program =
     | Prog of (string * (string * kind) list * kind * clambda) list * clambda
@@ -100,7 +100,7 @@ module Closure = struct
         if n = 0 then eval env e2 else eval env e1
     | Clet (id, _, e1, e2) ->
         eval (M.add id (eval env e1) env) e2
-    | Capply (id, idl) ->
+    | Capply (id, _, idl) ->
         let f = match find id env with
           | Vfun r -> !r
           | _ -> assert false
@@ -165,7 +165,7 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
     | Clet (id, k, e1, e2) ->
         Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
-    | Capply (id, idl) ->
+    | Capply (id, _, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Cprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
@@ -209,7 +209,7 @@ module Low : sig
   val load : t -> Llvm.llvalue -> Llvm.llvalue
   val store : t -> Llvm.llvalue -> Llvm.llvalue -> unit
   val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
-  val inttoptr : t -> Llvm.llvalue -> Llvm.llvalue
+  val inttoptr : t -> Llvm.llvalue -> Llvm.lltype -> Llvm.llvalue
   val ptrtoint : t -> Llvm.llvalue -> Llvm.llvalue
   val ret : t -> Llvm.llvalue -> unit
   val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
@@ -251,7 +251,7 @@ end = struct
   let gep c v vl =
     let vl = List.map (fun v -> Llvm.build_trunc v (Llvm.i32_type c.c) "" c.b) vl in
     Llvm.build_gep v (Array.of_list vl) "" c.b
-  let inttoptr c v = Llvm.build_inttoptr v (ptr_type c) "" c.b
+  let inttoptr c v t = Llvm.build_inttoptr v t "" c.b
   let ptrtoint c v = Llvm.build_ptrtoint v (int_type c) "" c.b
   let ret c v = ignore (Llvm.build_ret v c.b)
   let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
@@ -296,18 +296,22 @@ module Llvmgen = struct
   let toptr c id env =
     match find id env with
     | (v, Ptr) -> v
-    | (v, Int) -> Low.inttoptr c v
+    | (v, Int) -> Low.inttoptr c v (Low.ptr_type c)
 
   let toint c id env =
     match find id env with
     | (v, Ptr) -> Low.ptrtoint c v
     | (v, Int) -> v
 
+  let lltype c = function
+    | Ptr -> Low.ptr_type c
+    | Int -> Low.int_type c
+
   let rec compile c env = function
     | Cint n ->
         Low.int c n
     | Clabel id ->
-        Low.lookup_function c id
+        Low.ptrtoint c (Low.lookup_function c id)
     | Cvar id ->
         begin match find id env with
         | (v, Ptr) -> Low.load c v
@@ -338,9 +342,13 @@ module Llvmgen = struct
         let v = compile c (M.add id (a, Ptr) env) e2 in
         Low.store c (Llvm.const_null (Low.ptr_type c)) a;
         v
-    | Capply (id, idl) ->
-        let v = Low.lookup_function c id in
-        let vl = List.map (fun id -> fst (find id env)) idl in
+    | Capply (id, k, idl) ->
+        let v, _ = find id env in
+        let vl, atyps = List.split (List.map (fun id -> find id env) idl) in
+        let atyps = List.map (lltype c) atyps in
+        let rtype = lltype c k in
+        let t = Llvm.function_type rtype (Array.of_list atyps) in
+        let v = Low.inttoptr c v (Llvm.pointer_type t) in
         Low.call c v vl
     | Cprimitive (Pmakeblock, idl) ->
         let vl = List.map (fun id -> toint c id env) idl in
@@ -393,10 +401,8 @@ module Llvmgen = struct
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
-          let atyps =
-            List.map (function (_, Ptr) -> Low.ptr_type c | (_, Int) -> Low.int_type c) args
-          in
-          let rtype = match ret with Ptr -> Low.ptr_type c | Int -> Low.int_type c in
+          let atyps = List.map (function (_, k) -> lltype c k) args in
+          let rtype = lltype c ret in
           let f = Low.define_function c name atyps rtype in
           Llvm.set_function_call_conv Llvm.CallConv.fast f;
           M.add name (f, Int) env
@@ -439,7 +445,7 @@ let fact n =
       ("n", Clet
          ("c1", Int, Cint 1, Clet
             ("x1", Int, Cprimitive (Psubint, ["n"; "c1"]), Clet
-               ("x2", Int, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
+               ("x2", Int, Capply ("fact", Int, ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
        Cint 1)
   in
   let prog =
@@ -447,7 +453,7 @@ let fact n =
       "fact", ["n", Int], Int, fact;
     ]
   in
-  let main n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
+  let main n = Clet ("x", Int, Cint n, Capply ("fact", Int, ["x"])) in
   let prog = Prog (prog, main n) in
   Format.printf "@[%a@]@." print_program prog;
   Format.printf "@[%a\n@]@." print_value (eval_program prog);
