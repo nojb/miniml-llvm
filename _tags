@@ -2,3 +2,4 @@ true: package(llvm), package(llvm.executionengine)
 true: package(ctypes)
 true: bin_annot
 true: warn_error_A
+true: debug

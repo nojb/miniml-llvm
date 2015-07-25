@@ -340,15 +340,15 @@ module Closure = struct
 
   let all_funs : (string * (string * kind) list * kind * clambda) list ref = ref []
 
-  let rec transl env = function
+  let rec transl clos env = function
     | Kint n ->
         Cint n
     | Kvar id ->
         Cvar id
     | Kifthenelse (id, e1, e2) ->
-        Cifthenelse (id, transl env e1, transl env e2)
+        Cifthenelse (id, transl clos env e1, transl clos env e2)
     | Klet (id, k, e1, e2) ->
-        Clet (id, k, transl env e1, transl (M.add id k env) e2)
+        Clet (id, k, transl clos env e1, transl clos (M.add id k env) e2)
     | Kletrec (funs, e) ->
         let fvs =
           List.fold_left (fun s (id, args, _, e) ->
@@ -356,15 +356,17 @@ module Closure = struct
             ) S.empty funs
         in
         let fvs = S.elements fvs in
+        let siblings = List.map (fun (id, _, _, _) -> id) funs in
         List.fold_right (fun (id, args, k, body) e ->
             let clos = gentmp () in
             let i = ref (List.length fvs - 1) in
             let body =
+              let env = List.fold_left (fun env (id, k) -> M.add id k env) env args in
               List.fold_right (fun fv e ->
                   let n = !i in
                   decr i;
                   Clet (fv, find fv env, Cprimitive (Pgetfield n, [clos]), e)
-                ) fvs (transl (List.fold_left (fun env (id, k) -> M.add id k env) env args) body)
+                ) fvs (transl (clos, siblings) env body)
             in
             (* FIXME fv from sibling functions are not in env *)
             all_funs := (id, (clos, Ptr) :: args, k, body) :: !all_funs;
@@ -373,20 +375,25 @@ module Closure = struct
               (clos, Ptr, Cprimitive (Pmakeblock, fvs), Clet
                  (ff, Int, Clabel id, Clet
                     (id, Ptr, Cprimitive (Pmakeblock, [ff; clos]), e)))
-          ) funs (transl env e)
+          ) funs (transl clos env e)
     | Kapply (id, idl) ->
-        let tmp1 = gentmp () in
-        let tmp2 = gentmp () in
-        Clet
-          (tmp1, Int, Cprimitive (Pgetfield 0, [id]), Clet
-             (tmp2, Ptr, Cprimitive (Pgetfield 1, [id]), Capply
-                (tmp1, tmp2 :: idl)))
+        let (clos, siblings) = clos in
+        if List.mem id siblings then
+          let tmp1 = gentmp () in
+          Clet (tmp1, Int, Clabel id, Capply (tmp1, clos :: idl))
+        else
+          let tmp1 = gentmp () in
+          let tmp2 = gentmp () in
+          Clet
+            (tmp1, Int, Cprimitive (Pgetfield 0, [id]), Clet
+               (tmp2, Ptr, Cprimitive (Pgetfield 1, [id]), Capply
+                  (tmp1, tmp2 :: idl)))
     | Kprimitive (prim, idl) ->
         Cprimitive (prim, idl)
 
   let transl_program e =
     all_funs := [];
-    let e = transl M.empty e in
+    let e = transl ("", []) M.empty e in
     Prog (!all_funs, e)
 end
 
@@ -660,10 +667,26 @@ in
 
 let adder =
   let open Knf in
-  Kletrec (["adder", ["n", Int], Ptr, Kletrec (["aux", ["m", Int], Int, Kprimitive (Paddint, ["n"; "m"])], Kvar "aux")], Klet ("a", Int, Kint 3, Klet ("x", Ptr, Kapply ("adder", ["a"]), Klet ("y", Int, Kint 5, Kapply ("x", ["y"])))))
+  Kletrec
+    (["adder", ["n", Int], Ptr, Kletrec
+        (["aux", ["m", Int], Int, Kprimitive
+            (Paddint, ["n"; "m"])], Kvar "aux")],
+     Klet
+       ("a", Int, Kint 3, Klet
+          ("x", Ptr, Kapply
+             ("adder", ["a"]), Klet ("y", Int, Kint 5, Kapply ("x", ["y"])))))
+
+let fact' =
+  let open Knf in
+  Kletrec
+    (["fact", ["n", Int], Int, Kifthenelse
+        ("n", Klet ("c", Int, Kint 1, Klet ("x", Int, Kprimitive (Psubint, ["n"; "c"]),
+                                            Klet ("xx", Int, Kapply ("fact", ["x"]),
+                                                  Kprimitive (Pmulint, ["n"; "xx"])))),
+         Kint 1)], Klet ("u", Int, Kint 10, Kapply ("fact", ["u"])))
 
 let run prog =
-  Format.printf "%a@.@\n" Knf.print adder;
+  Format.printf "%a@.@\n" Knf.print prog;
   let prog = Closure.transl_program prog in
   Format.printf "%a@.@\n" Closure.print_program prog;
   let m = Llvmgen.compile_program prog in
@@ -700,7 +723,8 @@ let fact n =
   Prog (prog, main n)
 
 let () =
-  Printf.printf "Result: %d\n%!" (run adder)
+  Printf.printf "Result: %d\n%!" (run adder);
+  Printf.printf "Result: %d\n%!" (run fact')
   (* run (fact 10) *)
 
 (*
