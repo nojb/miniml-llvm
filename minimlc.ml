@@ -495,13 +495,11 @@ module Llvmgen = struct
     | Ptr -> Low.ptr_type c
     | Int -> Low.int_type c
 
-  let var c env id =
-    match find id env with
-    | (v, Ptr) -> Low.inttoptr c (Low.load c v) (Low.ptr_type c)
+  let var c env id = match find id env with
+    | (v, Ptr) -> Low.load c (Low.inttoptr c v (Low.ptr_type c))
     | (v, Int) -> v
 
-  let cast c k v =
-    match k, Llvm.classify_type (Llvm.type_of v) with
+  let cast c k v = match k, Llvm.classify_type (Llvm.type_of v) with
     | Ptr, Llvm.TypeKind.Pointer ->
         Low.pointercast c v (Low.ptr_type c)
     | Ptr, Llvm.TypeKind.Integer ->
@@ -513,7 +511,7 @@ module Llvmgen = struct
     | _ ->
         assert false
 
-  let rec compile c env k = function
+  let rec compile c env = function
     | Cint n ->
         Low.int c n
     | Clabel id ->
@@ -525,51 +523,41 @@ module Llvmgen = struct
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
-        let v1 = compile c env k e1 in
+        let v1 = compile c env e1 in
         let bb1 = Low.insertion_block c in
         Low.position_at_end c bb2;
-        let v2 = compile c env k e2 in
+        let v2 = compile c env e2 in
         let bb2 = Low.insertion_block c in
         let bb = Low.append_block c in
         Low.position_at_end c bb;
         Low.phi c [v1, bb1; v2, bb2]
     | Clet (id, Int, e1, e2) ->
-        compile c (M.add id (compile c env Int e1, Int) env) k e2
+        compile c (M.add id (compile c env e1, Int) env) e2
     | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env Ptr e1 in
-        let a = Low.alloca c (Low.ptr_type c) in
+        let v = compile c env e1 in
+        let a = Low.alloca c (Low.int_type c) in
         Low.store c v a;
-        let a' = Low.pointercast c a (Low.ptr_type c) in
-        let v = compile c (M.add id (a', Ptr) env) k e2 in
-        Low.store c (Llvm.const_null (Low.ptr_type c)) a;
+        let a' = Low.ptrtoint c a in
+        let v = compile c (M.add id (a', Ptr) env) e2 in
+        Low.store c (Llvm.const_null (Low.int_type c)) a;
         v
     | Capply (id, idl) ->
         let v, _ = find id env in
-        let _, atyps = List.split (List.map (fun id -> find id env) idl) in
+        let atyps = List.map (fun _ -> Low.int_type c) idl in
+        let rtype = Low.int_type c in
         let vl = List.map (var c env) idl in
-        let atyps = List.map (lltype c) atyps in
-        let rtype = lltype c k in
         let t = Llvm.function_type rtype (Array.of_list atyps) in
         let v = Low.inttoptr c v (Llvm.pointer_type t) in
-        let v = Low.call c v vl in
-        v
+        Low.call c v vl
     | Cprimitive (Pmakeblock, idl) ->
         let v = Low.malloc c (List.length idl) in
-        List.iteri (fun i id ->
-            match find id env with
-            | (v', Ptr) ->
-                let v' = Low.inttoptr c (Low.load c v') (Low.ptr_type c) in
-                Low.store c v'
-                  (Low.pointercast c (Low.gep c v [Low.int c i])
-                     (Llvm.pointer_type (Low.ptr_type c)))
-            | (v', Int) ->
-                Low.store c v' (Low.gep c v [Low.int c i])
-          ) idl;
-        cast c k v
+        let vl = List.map (var c env) idl in
+        List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
+        Low.ptrtoint c v
     | Cprimitive (Pgetfield i, [id]) ->
-        let v, _ = find id env in
-        let v = Low.inttoptr c (Low.load c v) (Low.ptr_type c) in
-        cast c k (Low.load c (Low.gep c v [Low.int c i]))
+        let v = var c env id in
+        let v = Low.inttoptr c v (Low.ptr_type c) in
+        Low.load c (Low.gep c v [Low.int c i])
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1, _ = find id1 env in
         let v2, _ = find id2 env in
@@ -585,36 +573,36 @@ module Llvmgen = struct
     | Cprimitive _ ->
         assert false
 
-  and compile_tail c env k = function
+  and compile_tail c env = function
     | Cint _ | Cvar _ | Cprimitive _ | Clabel _ as e -> (* TODO tail call *)
-        Low.ret c (compile c env k e)
+        Low.ret c (compile c env e)
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
-        compile_tail c env k e1;
+        compile_tail c env e1;
         Low.position_at_end c bb2;
-        compile_tail c env k e2
+        compile_tail c env e2
     | Clet (id, Int, e1, e2) ->
-        compile_tail c (M.add id (compile c env Int e1, Int) env) k e2
+        compile_tail c (M.add id (compile c env e1, Int) env) e2
     | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env Ptr e1 in
-        let a = Low.alloca c (Low.ptr_type c) in
+        let v = compile c env e1 in
+        let a = Low.alloca c (Low.int_type c) in
         Low.store c v a;
-        let a = Low.pointercast c a (Low.ptr_type c) in
-        compile_tail c (M.add id (a, Ptr) env) k e2
+        let a = Low.ptrtoint c a in
+        compile_tail c (M.add id (a, Ptr) env) e2
     | Capply _ as e ->
-        let v = compile c env k e in
+        let v = compile c env e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         Low.ret c v
 
-  let compile_fun c env k f body =
+  let compile_fun c env f body =
     Low.position_at_end c (Llvm.entry_block f);
     let bb = Low.append_block c in
     Low.position_at_end c bb;
-    compile_tail c env k body;
+    compile_tail c env body;
     Low.position_at_end c (Llvm.entry_block f);
     Low.br c bb
 
@@ -622,8 +610,8 @@ module Llvmgen = struct
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
-          let atyps = List.map (function (_, k) -> lltype c k) args in
-          let rtype = lltype c ret in
+          let atyps = List.map (fun _ -> Low.int_type c) args in
+          let rtype = Low.int_type c in
           let f = Low.define_function c name atyps rtype in
           Llvm.set_function_call_conv Llvm.CallConv.fast f;
           M.add name (f, Int) env
@@ -638,19 +626,19 @@ module Llvmgen = struct
               Llvm.set_value_name id v;
               let v = match k with
                 | Ptr ->
-                    let a = Low.alloca c (Low.ptr_type c) in
+                    let a = Low.alloca c (Low.int_type c) in
                     Low.store c v a;
                     Llvm.set_value_name id a;
-                    Low.pointercast c a (Low.ptr_type c)
+                    Low.ptrtoint c a
                 | Int -> v
               in
               M.add id (v, k) env
             ) env args params
         in
-        compile_fun c env k f body
+        compile_fun c env f body
       ) funs;
     let mainf = Low.define_function c "main" [] (Low.int_type c) in
-    compile_fun c env Int mainf main;
+    compile_fun c env mainf main;
     Low.llmodule c
 end
 
