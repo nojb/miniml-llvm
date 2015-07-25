@@ -491,27 +491,27 @@ end
 module Llvmgen = struct
   open Closure
 
-  let toptr c id env =
-    match find id env with
-    | (v, Ptr) -> v
-    | (v, Int) -> Low.inttoptr c v (Low.ptr_type c)
-
-  let toint c id env =
-    match find id env with
-    | (v, Ptr) -> Low.ptrtoint c v
-    | (v, Int) -> v
-
   let lltype c = function
     | Ptr -> Low.ptr_type c
     | Int -> Low.int_type c
 
+  let var c env id =
+    match find id env with
+    | (v, Ptr) -> Low.inttoptr c (Low.load c v) (Low.ptr_type c)
+    | (v, Int) -> v
+
   let cast c k v =
-    match Llvm.classify_type (Llvm.type_of v), k with
-    | Llvm.TypeKind.Pointer, Ptr
-    | Llvm.TypeKind.Integer, Int -> v
-    | Llvm.TypeKind.Pointer, Int -> Low.ptrtoint c v
-    | Llvm.TypeKind.Integer, Ptr -> Low.inttoptr c v (Low.ptr_type c)
-    | _ -> assert false
+    match k, Llvm.classify_type (Llvm.type_of v) with
+    | Ptr, Llvm.TypeKind.Pointer ->
+        Low.pointercast c v (Low.ptr_type c)
+    | Ptr, Llvm.TypeKind.Integer ->
+        Low.inttoptr c v (Low.ptr_type c)
+    | Int, Llvm.TypeKind.Pointer ->
+        Low.ptrtoint c v
+    | Int, Llvm.TypeKind.Integer ->
+        v
+    | _ ->
+        assert false
 
   let rec compile c env k = function
     | Cint n ->
@@ -519,10 +519,7 @@ module Llvmgen = struct
     | Clabel id ->
         Low.ptrtoint c (Low.lookup_function c id)
     | Cvar id ->
-        begin match find id env with
-        | (v, Ptr) -> Low.inttoptr c (Low.load c v) (Low.ptr_type c)
-        | (v, Int) -> v
-        end
+        var c env id
     | Cifthenelse (id, e1, e2) ->
         let v, _ = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
@@ -548,21 +545,30 @@ module Llvmgen = struct
         v
     | Capply (id, idl) ->
         let v, _ = find id env in
-        let vl, atyps = List.split (List.map (fun id -> find id env) idl) in
+        let _, atyps = List.split (List.map (fun id -> find id env) idl) in
+        let vl = List.map (var c env) idl in
         let atyps = List.map (lltype c) atyps in
         let rtype = lltype c k in
         let t = Llvm.function_type rtype (Array.of_list atyps) in
         let v = Low.inttoptr c v (Llvm.pointer_type t) in
         let v = Low.call c v vl in
-        Low.dump_module c;
         v
     | Cprimitive (Pmakeblock, idl) ->
-        let vl = List.map (fun id -> toint c id env) idl in
         let v = Low.malloc c (List.length idl) in
-        List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
+        List.iteri (fun i id ->
+            match find id env with
+            | (v', Ptr) ->
+                let v' = Low.inttoptr c (Low.load c v') (Low.ptr_type c) in
+                Low.store c v'
+                  (Low.pointercast c (Low.gep c v [Low.int c i])
+                     (Llvm.pointer_type (Low.ptr_type c)))
+            | (v', Int) ->
+                Low.store c v' (Low.gep c v [Low.int c i])
+          ) idl;
         cast c k v
     | Cprimitive (Pgetfield i, [id]) ->
-        let v = toptr c id env in
+        let v, _ = find id env in
+        let v = Low.inttoptr c (Low.load c v) (Low.ptr_type c) in
         cast c k (Low.load c (Low.gep c v [Low.int c i]))
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1, _ = find id1 env in
@@ -604,7 +610,15 @@ module Llvmgen = struct
         Llvm.set_tail_call true v;
         Low.ret c v
 
-  let compile (Prog (funs, main)) =
+  let compile_fun c env k f body =
+    Low.position_at_end c (Llvm.entry_block f);
+    let bb = Low.append_block c in
+    Low.position_at_end c bb;
+    compile_tail c env k body;
+    Low.position_at_end c (Llvm.entry_block f);
+    Low.br c bb
+
+  let compile_program (Prog (funs, main)) =
     let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
@@ -618,27 +632,25 @@ module Llvmgen = struct
     List.iter (fun (name, args, k, body) ->
         let (f, _) = find name env in
         let params = Array.to_list (Llvm.params f) in
+        Low.position_at_end c (Llvm.entry_block f);
         let env =
           List.fold_left2 (fun env (id, k) v ->
               Llvm.set_value_name id v;
+              let v = match k with
+                | Ptr ->
+                    let a = Low.alloca c (Low.ptr_type c) in
+                    Low.store c v a;
+                    Llvm.set_value_name id a;
+                    Low.pointercast c a (Low.ptr_type c)
+                | Int -> v
+              in
               M.add id (v, k) env
             ) env args params
         in
-        Low.position_at_end c (Llvm.entry_block f);
-        let bb = Low.append_block c in
-        Low.position_at_end c bb;
-        compile_tail c env k body;
-        Low.position_at_end c (Llvm.entry_block f);
-        Low.br c bb
+        compile_fun c env k f body
       ) funs;
     let mainf = Low.define_function c "main" [] (Low.int_type c) in
-    Low.position_at_end c (Llvm.entry_block mainf);
-    let bb = Low.append_block c in
-    Low.position_at_end c bb;
-    compile_tail c env Int main;
-    Low.position_at_end c (Llvm.entry_block mainf);
-    Low.br c bb;
-    Low.dump_module c;
+    compile_fun c env Int mainf main;
     Low.llmodule c
 end
 
@@ -666,7 +678,7 @@ let run prog =
   Format.printf "%a@.@\n" Knf.print adder;
   let prog = Closure.transl_program prog in
   Format.printf "%a@.@\n" Closure.print_program prog;
-  let m = Llvmgen.compile prog in
+  let m = Llvmgen.compile_program prog in
   Llvm.dump_module m;
   if not (Llvm_executionengine.initialize ()) then
     failwith "Execution engine could not be initialized";
