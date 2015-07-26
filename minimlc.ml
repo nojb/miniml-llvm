@@ -22,26 +22,24 @@
 let failwith fmt = Printf.ksprintf failwith fmt
 
 type primitive =
-  | Pmakeblock
-  | Pgetfield of int
+  | Pmake
   | Paddint
   | Pmulint
   | Psubint
-
-type kind =
-  | Ptr
-  | Int
-
-let string_of_kind = function
-  | Ptr -> "ptr"
-  | Int -> "int"
+  | Pload
+  | Pstore
+  | Palloca
+  | Pindex
 
 let string_of_primitive = function
-  | Pmakeblock -> "makeblock"
-  | Pgetfield i -> Printf.sprintf "#%d" i
+  | Pmake -> "makeblock"
   | Paddint -> "+"
   | Pmulint -> "*"
   | Psubint -> "-"
+  | Pload -> "load"
+  | Pstore -> "store"
+  | Palloca -> "alloca"
+  | Pindex -> "index"
 
 let gentmp =
   let count = ref 0 in
@@ -53,28 +51,44 @@ module S = Set.Make (String)
 let find id env =
   try M.find id env with Not_found -> failwith "find: %S not found" id
 
+type type_ =
+  | Tint
+  | Tpointer of type_
+  | Tstruct of string
+
+let rec print_type ppf = function
+  | Tint -> Format.pp_print_string ppf "int"
+  | Tpointer t -> Format.fprintf ppf "%a*" print_type t
+  | Tstruct id -> Format.pp_print_string ppf id
+
 module Knf = struct
   type knf =
-    | Kint of int
+    | Kint of nativeint
+    | Knil of string
     | Kvar of string
     | Kifthenelse of string * knf * knf
-    | Klet of string * kind * knf * knf
-    | Kletrec of (string * (string * kind) list * kind * knf) list * knf
+    | Klet of string * type_ * knf * knf
+    | Kletrec of (string * (string * type_) list * type_ * knf) list * knf
     | Kapply of string * string list
     | Kprimitive of primitive * string list
+    | Kwhile of knf * knf
+    | Kbreak
 
+  (*
   type value =
     | Vint of int
-    | Vtuple of value list
-    | Vfun of (value list -> value) ref
+    | Vstring of string
+    | Varray of value array
+    | Vstruct of value array
 
   let rec print_value ppf = function
     | Vint n ->
         Format.pp_print_int ppf n
-    | Vtuple vl ->
-        Format.fprintf ppf "@[<2>(%a)@]" print_values vl
-    | Vfun _ ->
-        Format.pp_print_string ppf "<fun>"
+    | Vstring s ->
+        Format.fprintf ppf "%S" s
+    | Varray _
+    | Vstruct _ ->
+        assert false
 
   and print_values ppf = function
     | [] -> ()
@@ -144,22 +158,29 @@ module Knf = struct
         Vint (n1 - n2)
     | Kprimitive _ ->
         assert false
+*)
 
   let rec print ppf = function
     | Kint n ->
-        Format.pp_print_int ppf n
+        Format.fprintf ppf "%nd" n
+    | Knil _ ->
+        Format.pp_print_string ppf "nil"
     | Kvar id ->
         Format.pp_print_string ppf id
     | Kifthenelse (id, e1, e2) ->
         Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
-    | Klet (id, k, e1, e2) ->
-        Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
+    | Klet (id, t, e1, e2) ->
+        Format.fprintf ppf "@[<2>(let (%s@ %a@ %a)@ %a)@]" id print_type t print e1 print e2
     | Kletrec (funs, e) ->
         Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ %a@])@]" print_funs funs print e
     | Kapply (id, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Kprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
+    | Kwhile (e1, e2) ->
+        Format.fprintf ppf "@[<2>(while@ %a@ %a)@]" print e1 print e2
+    | Kbreak ->
+        Format.pp_print_string ppf "(break)"
 
   and print_args ppf = function
     | [] -> ()
@@ -167,10 +188,10 @@ module Knf = struct
 
   and print_params ppf = function
     | [] -> ()
-    | (x, k) :: [] ->
-        Format.fprintf ppf "%s %s" x (string_of_kind k)
-    | (x, k) :: xs ->
-        Format.fprintf ppf "%s %s@ %a" x (string_of_kind k) print_params xs
+    | (x, t) :: [] ->
+        Format.fprintf ppf "%s@ %a" x print_type t
+    | (x, t) :: xs ->
+        Format.fprintf ppf "%s@ %a@ %a" x print_type t print_params xs
 
   and print_fun ppf (name, params, _, body) =
     Format.fprintf ppf "@[<2>(%s@ (%a)@ %a)@]" name print_params params print body
@@ -183,7 +204,7 @@ module Knf = struct
         Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
 
   let rec fv = function
-    | Kint _ -> S.empty
+    | Kint _ | Knil _ -> S.empty
     | Kvar id -> S.singleton id
     | Kifthenelse (id, e1, e2) -> S.add id (S.union (fv e1) (fv e2))
     | Klet (id, _, e1, e2) -> S.union (fv e1) (S.remove id (fv e2))
@@ -192,6 +213,10 @@ module Knf = struct
     | Kapply (_, idl)
     | Kprimitive (_, idl) ->
         List.fold_left (fun s id -> S.add id s) S.empty idl
+    | Kwhile (e1, e2) ->
+        S.union (fv e1) (fv e2)
+    | Kbreak ->
+        S.empty
 
   and fv_fun (_, args, _, body) =
     List.fold_left (fun s (id, _) -> S.remove id s) (fv body) args
@@ -199,14 +224,17 @@ end
 
 module Closure = struct
   type clambda =
-    | Cint of int
+    | Cint of nativeint
+    | Cnil of string
     | Cvar of string
     | Cifthenelse of string * clambda * clambda
-    | Clet of string * kind * clambda * clambda
+    | Clet of string * type_ * clambda * clambda
     | Capply of string * string list
     | Cprimitive of primitive * string list
+    | Cwhile of clambda * clambda
+    | Cbreak
   type program =
-    | Prog of (string * (string * kind) list * kind * clambda) list * clambda
+    | Prog of (string * (string * type_) list * type_ * clambda) list * clambda
 
   type value =
     | Vint of int
@@ -223,6 +251,7 @@ module Closure = struct
     | v :: [] -> print_value ppf v
     | v :: vl -> Format.fprintf ppf "%a@ %a" print_value v print_values vl
 
+  (*
   let all_funs = ref M.empty
 
   let rec eval env = function
@@ -239,14 +268,14 @@ module Closure = struct
     | Capply (id, idl) ->
         let f = find id !all_funs in
         f (List.map (fun id -> find id env) idl)
-    | Cprimitive (Pmakeblock, idl) ->
+    | Cprimitive (Pmake, idl) ->
         Vtuple (List.map (fun id -> find id env) idl)
-    | Cprimitive (Pgetfield i, [id]) ->
+(*    | Cprimitive (Pgetfield i, [id]) ->
         let l = match find id env with
           | Vtuple l ->  l
           | _ -> assert false
         in
-        List.nth l i
+        List.nth l i *)
     | Cprimitive (Paddint, [id1; id2]) ->
         let n1, n2 = match find id1 env, find id2 env with
           | Vint n1, Vint n2 -> n1, n2
@@ -279,20 +308,26 @@ module Closure = struct
         all_funs := M.add id f !all_funs
       ) funs;
     eval M.empty main
-
+*)
   let rec print ppf = function
     | Cint n ->
-        Format.pp_print_int ppf n
+        Format.fprintf ppf "%nd" n
+    | Cnil _ ->
+        Format.fprintf ppf "nil"
     | Cvar id ->
         Format.pp_print_string ppf id
     | Cifthenelse (id, e1, e2) ->
         Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
-    | Clet (id, k, e1, e2) ->
-        Format.fprintf ppf "@[<2>(let (%s %s@ %a)@ %a)@]" id (string_of_kind k) print e1 print e2
+    | Clet (id, t, e1, e2) ->
+        Format.fprintf ppf "@[<2>(let (%s@ %a@ %a)@ %a)@]" id print_type t print e1 print e2
     | Capply (id, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Cprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
+    | Cwhile (e1, e2) ->
+        Format.fprintf ppf "@[<2>(while@ %a@ %a)@]" print e1 print e2
+    | Cbreak ->
+        Format.pp_print_string ppf "(break)"
 
   and print_args ppf = function
     | [] -> ()
@@ -300,10 +335,10 @@ module Closure = struct
 
   let rec print_params ppf = function
     | [] -> ()
-    | (x, k) :: [] ->
-        Format.fprintf ppf "%s %s" x (string_of_kind k)
-    | (x, k) :: xs ->
-        Format.fprintf ppf "%s %s@ %a" x (string_of_kind k) print_params xs
+    | (x, t) :: [] ->
+        Format.fprintf ppf "%s@ %a" x print_type t
+    | (x, t) :: xs ->
+        Format.fprintf ppf "%s@ %a@ %a" x print_type t print_params xs
 
   let print_fun ppf (name, params, _, body) =
     Format.fprintf ppf "@[<2>(%s@ (%a)@ %a)@]" name print_params params print body
@@ -320,11 +355,13 @@ module Closure = struct
 
   open Knf
 
-  let all_funs : (string * (string * kind) list * kind * clambda) list ref = ref []
+  let all_funs : (string * (string * type_) list * type_ * clambda) list ref = ref []
 
   let rec transl clos env = function
     | Kint n ->
         Cint n
+    | Knil id ->
+        Cnil id
     | Kvar id ->
         Cvar id
     | Kifthenelse (id, e1, e2) ->
@@ -347,6 +384,10 @@ module Closure = struct
         Capply (id, fvs @ idl)
     | Kprimitive (prim, idl) ->
         Cprimitive (prim, idl)
+    | Kwhile (e1, e2) ->
+        Cwhile (transl clos env e1, transl clos env e2)
+    | Kbreak ->
+        Cbreak
 
   let transl_program e =
     all_funs := [];
@@ -455,17 +496,15 @@ end
 module Llvmgen = struct
   open Closure
 
-  let var c env id = match find id env with
-    | (v, Ptr) -> Low.load c (Low.inttoptr c v (Low.ptr_type c))
-    | (v, Int) -> v
-
   let rec compile c env = function
     | Cint n ->
-        Low.int c n
+        Low.int c (Nativeint.to_int n) (* FIXME *)
+    | Cnil _ ->
+        assert false
     | Cvar id ->
-        var c env id
+        find id env
     | Cifthenelse (id, e1, e2) ->
-        let v, _ = find id env in
+        let v = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
@@ -477,68 +516,74 @@ module Llvmgen = struct
         let bb = Low.append_block c in
         Low.position_at_end c bb;
         Low.phi c [v1, bb1; v2, bb2]
-    | Clet (id, Int, e1, e2) ->
-        compile c (M.add id (compile c env e1, Int) env) e2
-    | Clet (id, Ptr, e1, e2) ->
+    | Clet (id, _, e1, e2) ->
+        compile c (M.add id (compile c env e1) env) e2
+(*    | Clet (id, _, e1, e2) ->
         let v = compile c env e1 in
         let a = Low.alloca c (Low.int_type c) in
         Low.store c v a;
         let a' = Low.ptrtoint c a in
         let v = compile c (M.add id (a', Ptr) env) e2 in
         Low.store c (Llvm.const_null (Low.int_type c)) a;
-        v
+        v *)
     | Capply (id, idl) ->
         let v = Low.lookup_function c id in
-        let vl = List.map (var c env) idl in
+        let vl = List.map (fun id -> find id env) idl in
         Low.call c v vl
-    | Cprimitive (Pmakeblock, idl) ->
+    | Cprimitive (Pmake, idl) ->
         let v = Low.malloc c (List.length idl) in
-        let vl = List.map (var c env) idl in
+        let vl = List.map (fun id -> find id env) idl in
         List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
         Low.ptrtoint c v
-    | Cprimitive (Pgetfield i, [id]) ->
-        let v = var c env id in
-        let v = Low.inttoptr c v (Low.ptr_type c) in
-        Low.load c (Low.gep c v [Low.int c i])
+    | Cprimitive (Pindex, [id1; id2]) ->
+        let v1 = find id1 env in
+        let v2 = find id2 env in
+        Low.load c (Low.gep c v1 [v2])
     | Cprimitive (Paddint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
+        let v1 = find id1 env in
+        let v2 = find id2 env in
         Low.add c v1 v2
     | Cprimitive (Pmulint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
+        let v1 = find id1 env in
+        let v2 = find id2 env in
         Low.mul c v1 v2
     | Cprimitive (Psubint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
+        let v1 = find id1 env in
+        let v2 = find id2 env in
         Low.sub c v1 v2
     | Cprimitive _ ->
         assert false
+    | Cwhile _ | Cbreak ->
+        assert false
 
   and compile_tail c env = function
-    | Cint _ | Cvar _ | Cprimitive _ as e -> (* TODO tail call *)
+    | Cint _ | Cnil _ | Cvar _ | Cprimitive _ as e ->
         Low.ret c (compile c env e)
     | Cifthenelse (id, e1, e2) ->
-        let v, _ = find id env in
+        let v = find id env in
         let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
         let bb1, bb2 = Low.cond_br c v in
         Low.position_at_end c bb1;
         compile_tail c env e1;
         Low.position_at_end c bb2;
         compile_tail c env e2
-    | Clet (id, Int, e1, e2) ->
-        compile_tail c (M.add id (compile c env e1, Int) env) e2
-    | Clet (id, Ptr, e1, e2) ->
+    | Clet (id, _, e1, e2) ->
+        compile_tail c (M.add id (compile c env e1) env) e2
+(*    | Clet (id, Ptr, e1, e2) ->
         let v = compile c env e1 in
         let a = Low.alloca c (Low.int_type c) in
         Low.store c v a;
         let a = Low.ptrtoint c a in
-        compile_tail c (M.add id (a, Ptr) env) e2
+        compile_tail c (M.add id (a, Ptr) env) e2 *)
     | Capply _ as e ->
         let v = compile c env e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         Low.ret c v
+    | Cwhile _ ->
+        assert false
+    | Cbreak ->
+        assert false
 
   let compile_fun c env f body =
     Low.position_at_end c (Llvm.entry_block f);
@@ -556,25 +601,25 @@ module Llvmgen = struct
           let rtype = Low.int_type c in
           let f = Low.define_function c name atyps rtype in
           Llvm.set_function_call_conv Llvm.CallConv.fast f;
-          M.add name (f, Int) env
+          M.add name f env
         ) M.empty funs
     in
-    List.iter (fun (name, args, k, body) ->
-        let (f, _) = find name env in
+    List.iter (fun (name, args, _, body) ->
+        let f = find name env in
         let params = Array.to_list (Llvm.params f) in
         Low.position_at_end c (Llvm.entry_block f);
         let env =
-          List.fold_left2 (fun env (id, k) v ->
+          List.fold_left2 (fun env (id, _) v ->
               Llvm.set_value_name id v;
-              let v = match k with
+(*              let v = match k with
                 | Ptr ->
                     let a = Low.alloca c (Low.int_type c) in
                     Low.store c v a;
                     Llvm.set_value_name id a;
                     Low.ptrtoint c a
                 | Int -> v
-              in
-              M.add id (v, k) env
+                in*)
+              M.add id v env
             ) env args params
         in
         compile_fun c env f body
@@ -603,20 +648,20 @@ in
 let adder =
   let open Knf in
   Kletrec
-    (["adder", ["n", Int], Int, Kletrec
-        (["aux", ["m", Int], Int, Kprimitive
-            (Paddint, ["n"; "m"])], Klet ("u", Int, Kint 5, Kapply ("aux", ["u"])))],
+    (["adder", ["n", Tint], Tint, Kletrec
+        (["aux", ["m", Tint], Tint, Kprimitive
+            (Paddint, ["n"; "m"])], Klet ("u", Tint, Kint 5n, Kapply ("aux", ["u"])))],
      Klet
-       ("a", Int, Kint 3, Kapply ("adder", ["a"])))
+       ("a", Tint, Kint 3n, Kapply ("adder", ["a"])))
 
 let fact' =
   let open Knf in
   Kletrec
-    (["fact", ["n", Int], Int, Kifthenelse
-        ("n", Klet ("c", Int, Kint 1, Klet ("x", Int, Kprimitive (Psubint, ["n"; "c"]),
-                                            Klet ("xx", Int, Kapply ("fact", ["x"]),
+    (["fact", ["n", Tint], Tint, Kifthenelse
+        ("n", Klet ("c", Tint, Kint 1n, Klet ("x", Tint, Kprimitive (Psubint, ["n"; "c"]),
+                                            Klet ("xx", Tint, Kapply ("fact", ["x"]),
                                                   Kprimitive (Pmulint, ["n"; "xx"])))),
-         Kint 1)], Klet ("u", Int, Kint 10, Kapply ("fact", ["u"])))
+         Kint 1n)], Klet ("u", Tint, Kint 10n, Kapply ("fact", ["u"])))
 
 let run prog =
   Format.printf "%a@.@\n" Knf.print prog;
@@ -642,17 +687,17 @@ let fact n =
   let fact =
     Cifthenelse
       ("n", Clet
-         ("c1", Int, Cint 1, Clet
-            ("x1", Int, Cprimitive (Psubint, ["n"; "c1"]), Clet
-               ("x2", Int, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
-       Cint 1)
+         ("c1", Tint, Cint 1n, Clet
+            ("x1", Tint, Cprimitive (Psubint, ["n"; "c1"]), Clet
+               ("x2", Tint, Capply ("fact", ["x1"]), Cprimitive (Pmulint, ["n"; "x2"])))),
+       Cint 1n)
   in
   let prog =
     [
-      "fact", ["n", Int], Int, fact;
+      "fact", ["n", Tint], Tint, fact;
     ]
   in
-  let main n = Clet ("x", Int, Cint n, Capply ("fact", ["x"])) in
+  let main n = Clet ("x", Tint, Cint n, Capply ("fact", ["x"])) in
   Prog (prog, main n)
 
 let () =
