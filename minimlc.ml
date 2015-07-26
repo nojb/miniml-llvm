@@ -446,6 +446,9 @@ module L (X : sig val m : Llvm.llmodule end) = struct
     Llvm.build_pointercast v (Llvm.pointer_type t) "" b
   let position_at_end bb = Llvm.position_at_end bb b
   let insertion_block () = Llvm.insertion_block b
+  let type_by_name id = match Llvm.type_by_name m id with
+    | None -> failwith "type_by_name: could not find type %S" id
+    | Some t -> t
 end
 
 module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
@@ -467,8 +470,8 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
   let rec compile brk env = function
     | Cint n ->
         Low.int (Nativeint.to_int n) (* FIXME *)
-    | Cnil _ ->
-        assert false
+    | Cnil t ->
+        Llvm.const_null (Llvm.pointer_type (Low.type_by_name t))
     | Cvar id ->
         find id env
     | Cifthenelse (id, e1, e2) ->
