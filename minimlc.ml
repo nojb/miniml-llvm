@@ -22,6 +22,46 @@
 let failwith fmt = Printf.ksprintf failwith fmt
 
 module Typing = struct
+  type exp_type =
+    | Tint
+    | Tstring
+    | Tstruct of named_type
+
+  and named_type =
+    | Narray of exp_type
+    | Nrecord of exp_type list
+
+  type exp =
+    { edesc : exp_desc;
+      etype : exp_type }
+
+  and exp_desc =
+    | Eint of nativeint
+    | Estring of string
+    | Enil of string
+    | Eif of exp * exp * exp
+    | Esequence of exp * exp
+    | Eunit
+    | Eassign of lval * exp
+    | Eval of lval
+    | Eapply of string * exp list
+    | Ewhile of exp * exp
+    | Ebreak
+    | Eletvar of string * exp * exp
+    | Eletrec of (string * (string * exp_type) list * exp) * exp
+
+  and lval =
+    { ldesc : lval_desc;
+      ltype : exp_type }
+
+  and lval_desc =
+    | Lvar of string
+    | Lfield of lval * string
+    | Lindex of lval * exp
+
+  type program =
+    { typs : (string * exp_type list) list;
+      prog : exp }
 end
 
 type type_ =
