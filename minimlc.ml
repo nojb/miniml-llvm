@@ -22,7 +22,7 @@
 let failwith fmt = Printf.ksprintf failwith fmt
 
 type primitive =
-  | Pmake
+  | Pmalloc
   | Paddint
   | Pmulint
   | Psubint
@@ -32,7 +32,7 @@ type primitive =
   | Pindex
 
 let string_of_primitive = function
-  | Pmake -> "makeblock"
+  | Pmalloc -> "malloc"
   | Paddint -> "+"
   | Pmulint -> "*"
   | Psubint -> "-"
@@ -518,27 +518,15 @@ module Llvmgen = struct
         Low.phi c [v1, bb1; v2, bb2]
     | Clet (id, _, e1, e2) ->
         compile c (M.add id (compile c env e1) env) e2
-(*    | Clet (id, _, e1, e2) ->
-        let v = compile c env e1 in
-        let a = Low.alloca c (Low.int_type c) in
-        Low.store c v a;
-        let a' = Low.ptrtoint c a in
-        let v = compile c (M.add id (a', Ptr) env) e2 in
-        Low.store c (Llvm.const_null (Low.int_type c)) a;
-        v *)
     | Capply (id, idl) ->
         let v = Low.lookup_function c id in
         let vl = List.map (fun id -> find id env) idl in
         Low.call c v vl
-    | Cprimitive (Pmake, idl) ->
+    | Cprimitive (Pmalloc, idl) ->
         let v = Low.malloc c (List.length idl) in
         let vl = List.map (fun id -> find id env) idl in
         List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
         Low.ptrtoint c v
-    | Cprimitive (Pindex, [id1; id2]) ->
-        let v1 = find id1 env in
-        let v2 = find id2 env in
-        Low.load c (Low.gep c v1 [v2])
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1 = find id1 env in
         let v2 = find id2 env in
@@ -551,6 +539,20 @@ module Llvmgen = struct
         let v1 = find id1 env in
         let v2 = find id2 env in
         Low.sub c v1 v2
+    | Cprimitive (Pload, [id]) ->
+        Low.load c (find id env)
+    | Cprimitive (Pstore, [id1; id2]) ->
+        Low.store c (find id1 env) (find id2 env);
+        Llvm.undef (Low.int_type c)
+    | Cprimitive (Palloca, [id]) ->
+        let v = find id env in
+        let a = Low.alloca c (Llvm.type_of v) in
+        Low.store c v a;
+        a
+    | Cprimitive (Pindex, [id1; id2]) ->
+        let v1 = find id1 env in
+        let v2 = find id2 env in
+        Low.load c (Low.gep c v1 [v2])
     | Cprimitive _ ->
         assert false
     | Cwhile _ | Cbreak ->
