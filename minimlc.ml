@@ -71,8 +71,8 @@ module Knf = struct
     | Kletrec of (string * (string * type_) list * type_ * knf) list * knf
     | Kapply of string * string list
     | Kprimitive of primitive * string list
-    | Kwhile of knf * knf
-    | Kbreak
+    | Kloop of knf
+    | Kbreak of type_
 
   (*
   type value =
@@ -177,10 +177,10 @@ module Knf = struct
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Kprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
-    | Kwhile (e1, e2) ->
-        Format.fprintf ppf "@[<2>(while@ %a@ %a)@]" print e1 print e2
-    | Kbreak ->
-        Format.pp_print_string ppf "(break)"
+    | Kloop e ->
+        Format.fprintf ppf "@[<2>(loop@ %a)@]" print e
+    | Kbreak t ->
+        Format.fprintf ppf "@[<2>(break@ %a)@]" print_type t
 
   and print_args ppf = function
     | [] -> ()
@@ -213,9 +213,9 @@ module Knf = struct
     | Kapply (_, idl)
     | Kprimitive (_, idl) ->
         List.fold_left (fun s id -> S.add id s) S.empty idl
-    | Kwhile (e1, e2) ->
-        S.union (fv e1) (fv e2)
-    | Kbreak ->
+    | Kloop e ->
+        fv e
+    | Kbreak _ ->
         S.empty
 
   and fv_fun (_, args, _, body) =
@@ -231,8 +231,8 @@ module Closure = struct
     | Clet of string * type_ * clambda * clambda
     | Capply of string * string list
     | Cprimitive of primitive * string list
-    | Cwhile of clambda * clambda
-    | Cbreak
+    | Cloop of clambda
+    | Cbreak of type_
   type program =
     | Prog of (string * (string * type_) list * type_ * clambda) list * clambda
 
@@ -324,10 +324,10 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
     | Cprimitive (prim, idl) ->
         Format.fprintf ppf "@[<2>(%s%a)@]" (string_of_primitive prim) print_args idl
-    | Cwhile (e1, e2) ->
-        Format.fprintf ppf "@[<2>(while@ %a@ %a)@]" print e1 print e2
-    | Cbreak ->
-        Format.pp_print_string ppf "(break)"
+    | Cloop e ->
+        Format.fprintf ppf "@[<2>(loop@ %a)@]" print e
+    | Cbreak t ->
+        Format.fprintf ppf "@[<2>(break@ %a)]" print_type t
 
   and print_args ppf = function
     | [] -> ()
@@ -384,10 +384,10 @@ module Closure = struct
         Capply (id, fvs @ idl)
     | Kprimitive (prim, idl) ->
         Cprimitive (prim, idl)
-    | Kwhile (e1, e2) ->
-        Cwhile (transl clos env e1, transl clos env e2)
-    | Kbreak ->
-        Cbreak
+    | Kloop e ->
+        Cloop (transl clos env e)
+    | Kbreak t ->
+        Cbreak t
 
   let transl_program e =
     all_funs := [];
@@ -451,7 +451,16 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
 
   module Low = L (X)
 
-  let rec compile env = function
+  let rec compile_type = function
+    | Tint -> Low.i32
+    | Tpointer t -> Llvm.pointer_type (compile_type t)
+    | Tstruct id ->
+        begin match Llvm.type_by_name Low.m id with
+        | Some t -> t
+        | None -> failwith "compile_type: could not find type %S" id
+        end
+
+  let rec compile brk env = function
     | Cint n ->
         Low.int (Nativeint.to_int n) (* FIXME *)
     | Cnil _ ->
@@ -463,16 +472,16 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         let v = Low.icmp Llvm.Icmp.Ne v (Low.int 0) in
         let bb1, bb2 = Low.cond_br v in
         Low.position_at_end bb1;
-        let v1 = compile env e1 in
+        let v1 = compile brk env e1 in
         let bb1 = Low.insertion_block () in
         Low.position_at_end bb2;
-        let v2 = compile env e2 in
+        let v2 = compile brk env e2 in
         let bb2 = Low.insertion_block () in
         let bb = Low.append_block () in
         Low.position_at_end bb;
         Low.phi [v1, bb1; v2, bb2]
     | Clet (id, _, e1, e2) ->
-        compile (M.add id (compile env e1) env) e2
+        compile brk (M.add id (compile brk env e1) env) e2
     | Capply (id, idl) ->
         let v = Low.lookup_function id in
         let vl = List.map (fun id -> find id env) idl in
@@ -510,12 +519,26 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         Low.load (Low.gep v1 [v2])
     | Cprimitive _ ->
         assert false
-    | Cwhile _ | Cbreak ->
-        assert false
+    | Cloop e ->
+        let bb1 = Low.append_block () in
+        let bb2 = Low.append_block () in
+        Low.position_at_end bb1;
+        let _v = compile (Some bb2) env e in
+        Low.br bb1;
+        Low.position_at_end bb2;
+        Low.int 0
+    | Cbreak t ->
+        begin match brk with
+        | None ->
+            assert false
+        | Some bb ->
+            Low.br bb;
+            Llvm.undef (compile_type t)
+        end
 
   and compile_tail env = function
     | Cint _ | Cnil _ | Cvar _ | Cprimitive _ as e ->
-        Low.ret (compile env e)
+        Low.ret (compile None env e)
     | Cifthenelse (id, e1, e2) ->
         let v = find id env in
         let v = Low.icmp Llvm.Icmp.Ne v (Low.int 0) in
@@ -525,21 +548,15 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         Low.position_at_end bb2;
         compile_tail env e2
     | Clet (id, _, e1, e2) ->
-        compile_tail (M.add id (compile env e1) env) e2
-(*    | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env e1 in
-        let a = Low.alloca c (Low.int_type c) in
-        Low.store c v a;
-        let a = Low.ptrtoint c a in
-        compile_tail c (M.add id (a, Ptr) env) e2 *)
+        compile_tail (M.add id (compile None env e1) env) e2
     | Capply _ as e ->
-        let v = compile env e in
+        let v = compile None env e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         Low.ret v
-    | Cwhile _ ->
-        assert false
-    | Cbreak ->
+    | Cloop _ as e ->
+        Low.ret (compile None env e)
+    | Cbreak _ ->
         assert false
 
   let compile_fun env f body =
@@ -549,15 +566,6 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
     compile_tail env body;
     Low.position_at_end (Llvm.entry_block f);
     Low.br bb
-
-  let rec compile_type = function
-    | Tint -> Low.i32
-    | Tpointer t -> Llvm.pointer_type (compile_type t)
-    | Tstruct id ->
-        begin match Llvm.type_by_name Low.m id with
-        | Some t -> t
-        | None -> failwith "compile_type: could not find type %S" id
-        end
 
   let compile_program (Prog (funs, main)) =
     let env =
