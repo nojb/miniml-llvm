@@ -21,6 +21,9 @@
 
 let failwith fmt = Printf.ksprintf failwith fmt
 
+module Typing = struct
+end
+
 type type_ =
   | Tint
   | Tarray of int * type_
@@ -236,7 +239,9 @@ module Closure = struct
     | Cloop of clambda
     | Cbreak of type_
   type program =
-    | Prog of (string * (string * type_) list * type_ * clambda) list * clambda
+    { funs : (string * (string * type_) list * type_ * clambda) list;
+      recs : (string * type_ list) list;
+      main : clambda }
 
   type value =
     | Vint of int
@@ -352,7 +357,7 @@ module Closure = struct
     | f :: funs ->
         Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
 
-  let print_program ppf (Prog (funs, main)) =
+  let print_program ppf {funs; recs; main} =
     Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ %a@])@]" print_funs funs print main
 
   open Knf
@@ -394,7 +399,7 @@ module Closure = struct
   let transl_program e =
     all_funs := [];
     let e = transl M.empty M.empty e in
-    Prog (!all_funs, e)
+    {funs = !all_funs; recs = []; main = e} (* FIXME  *)
 end
 
 module L (X : sig val m : Llvm.llmodule end) = struct
@@ -544,7 +549,7 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         end
 
   and compile_tail env = function
-    | Cint _ | Cnil _ | Cvar _ | Cprimitive _ as e ->
+    | Cint _ | Cnil _ | Cvar _ | Cprimitive _ | Cloop _ as e ->
         Low.ret (compile None env e)
     | Cifthenelse (id, e1, e2) ->
         let v = find id env in
@@ -561,8 +566,6 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         Low.ret v
-    | Cloop _ as e ->
-        Low.ret (compile None env e)
     | Cbreak _ ->
         assert false
 
@@ -574,7 +577,12 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
     Low.position_at_end (Llvm.entry_block f);
     Low.br bb
 
-  let compile_program (Prog (funs, main)) =
+  let compile_program {funs; recs; main} =
+    let typs = List.map (fun (id, _) -> Llvm.named_struct_type Low.c id) recs in
+    List.iter2 (fun (_, fields) t ->
+        let fields = List.map compile_type fields in
+        Llvm.struct_set_body t (Array.of_list fields) false
+      ) recs typs;
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
           let atyps = List.map (fun (_, t) -> compile_type t) args in
@@ -671,7 +679,7 @@ let fact n =
     ]
   in
   let main n = Clet ("x", Tint, Cint n, Capply ("fact", ["x"])) in
-  Prog (prog, main n)
+  {funs = prog; recs = []; main = main n}
 
 let () =
   Printf.printf "Result: %d\n%!" (run adder);
