@@ -395,182 +395,137 @@ module Closure = struct
     Prog (!all_funs, e)
 end
 
-module Low : sig
-  type t
-  val create : string -> t
-  val int_type : t -> Llvm.lltype
-  val ptr_type : t -> Llvm.lltype
-  val int : t -> int -> Llvm.llvalue
-  val load : t -> Llvm.llvalue -> Llvm.llvalue
-  val store : t -> Llvm.llvalue -> Llvm.llvalue -> unit
-  val gep : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
-  val inttoptr : t -> Llvm.llvalue -> Llvm.lltype -> Llvm.llvalue
-  val ptrtoint : t -> Llvm.llvalue -> Llvm.llvalue
-  val ret : t -> Llvm.llvalue -> unit
-  val icmp : t -> Llvm.Icmp.t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
-  val phi : t -> (Llvm.llvalue * Llvm.llbasicblock) list -> Llvm.llvalue
-  val alloca : t -> Llvm.lltype -> Llvm.llvalue
-  val cond_br : t -> Llvm.llvalue -> Llvm.llbasicblock * Llvm.llbasicblock
-  val br : t -> Llvm.llbasicblock -> unit
-  val append_block : t -> Llvm.llbasicblock
-  val position_at_end : t -> Llvm.llbasicblock -> unit
-  val entry_block : t -> Llvm.llbasicblock
-  val lookup_function : t -> string -> Llvm.llvalue
-  val define_function : t -> string -> Llvm.lltype list -> Llvm.lltype -> Llvm.llvalue
-  val dump_module : t -> unit
-  val insertion_block : t -> Llvm.llbasicblock
-  val add : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
-  val mul : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
-  val sub : t -> Llvm.llvalue -> Llvm.llvalue -> Llvm.llvalue
-  val call : t -> Llvm.llvalue -> Llvm.llvalue list -> Llvm.llvalue
-  val malloc : t -> int -> Llvm.llvalue
-  val llmodule : t -> Llvm.llmodule
-  val pointercast : t -> Llvm.llvalue -> Llvm.lltype -> Llvm.llvalue
-end = struct
-  type t =
-    { c : Llvm.llcontext;
-      b : Llvm.llbuilder;
-      m : Llvm.llmodule }
-  let create name =
-    let c = Llvm.create_context () in
-    let b = Llvm.builder c in
-    let m = Llvm.create_module c name in
-    { c; b; m }
-  let int_type c =
-    match Sys.word_size with
-    | 32 -> Llvm.i32_type c.c
-    | 64 -> Llvm.i64_type c.c
-    | _ -> assert false
-  let ptr_type c = Llvm.pointer_type (int_type c)
-  let int c n = Llvm.const_int (int_type c) n
-  let load c v = Llvm.build_load v "" c.b
-  let store c v p = ignore (Llvm.build_store v p c.b)
-  let gep c v vl =
-    let vl = List.map (fun v -> Llvm.build_trunc v (Llvm.i32_type c.c) "" c.b) vl in
-    Llvm.build_gep v (Array.of_list vl) "" c.b
-  let inttoptr c v t = Llvm.build_inttoptr v t "" c.b
-  let ptrtoint c v = Llvm.build_ptrtoint v (int_type c) "" c.b
-  let ret c v = ignore (Llvm.build_ret v c.b)
-  let icmp c comp v1 v2 = Llvm.build_icmp comp v1 v2 "" c.b
-  let phi c l = Llvm.build_phi l "" c.b
-  let alloca c t =
+module L (X : sig val m : Llvm.llmodule end) = struct
+  let c = Llvm.module_context X.m
+  let b = Llvm.builder c
+  let m = X.m
+  let i32 = Llvm.i32_type c
+  let pointer = Llvm.pointer_type
+  let int n = Llvm.const_int i32 n
+  let load v = Llvm.build_load v "" b
+  let store v p = ignore (Llvm.build_store v p b)
+  let gep v vl = Llvm.build_gep v (Array.of_list vl) "" b
+  let ret v = ignore (Llvm.build_ret v b)
+  let icmp comp v1 v2 = Llvm.build_icmp comp v1 v2 "" b
+  let phi l = Llvm.build_phi l "" b
+  let alloca t =
     let b =
-      Llvm.builder_at_end c.c (Llvm.entry_block (Llvm.block_parent (Llvm.insertion_block c.b)))
+      Llvm.builder_at_end c
+        (Llvm.entry_block (Llvm.block_parent (Llvm.insertion_block b)))
     in
     Llvm.build_alloca t "" b
-  let cond_br c v =
-    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
-    let bb1 = Llvm.append_block c.c "" f in
-    let bb2 = Llvm.append_block c.c "" f in
-    ignore (Llvm.build_cond_br v bb1 bb2 c.b);
+  let cond_br v =
+    let f = Llvm.block_parent (Llvm.insertion_block b) in
+    let bb1 = Llvm.append_block c "" f in
+    let bb2 = Llvm.append_block c "" f in
+    ignore (Llvm.build_cond_br v bb1 bb2 b);
     bb1, bb2
-  let br c bb = ignore (Llvm.build_br bb c.b)
-  let append_block c =
-    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
-    Llvm.append_block c.c "" f
-  let position_at_end c bb =
-    Llvm.position_at_end bb c.b
+  let br bb = ignore (Llvm.build_br bb b)
+  let append_block () =
+    let f = Llvm.block_parent (Llvm.insertion_block b) in
+    Llvm.append_block c "" f
   let entry_block c =
-    let f = Llvm.block_parent (Llvm.insertion_block c.b) in
+    let f = Llvm.block_parent (Llvm.insertion_block b) in
     Llvm.entry_block f
-  let lookup_function c id =
-    match Llvm.lookup_function id c.m with
+  let lookup_function id = match Llvm.lookup_function id m with
     | None -> failwith "Low: function %S not found" id
     | Some v -> v
-  let define_function c name atyps rtype =
-    Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) c.m
-  let dump_module c = Llvm.dump_module c.m
-  let insertion_block c = Llvm.insertion_block c.b
-  let add c v1 v2 = Llvm.build_add v1 v2 "" c.b
-  let mul c v1 v2 = Llvm.build_mul v1 v2 "" c.b
-  let sub c v1 v2 = Llvm.build_sub v1 v2 "" c.b
-  let call c v vl = Llvm.build_call v (Array.of_list vl) "" c.b
-  let malloc c n =
-    let t = Llvm.function_type (ptr_type c) [| Llvm.i32_type c.c |] in
-    let f = Llvm.declare_function "malloc" t c.m in
-    Llvm.build_call f [| Llvm.const_int (Llvm.i32_type c.c) (n * Sys.word_size / 8) |] "" c.b
-  let llmodule c = c.m
-  let pointercast c v t = Llvm.build_pointercast v t "" c.b
+  let define_function name atyps rtype =
+    Llvm.define_function name (Llvm.function_type rtype (Array.of_list atyps)) m
+  let dump_module () = Llvm.dump_module m
+  let add v1 v2 = Llvm.build_add v1 v2 "" b
+  let mul v1 v2 = Llvm.build_mul v1 v2 "" b
+  let sub v1 v2 = Llvm.build_sub v1 v2 "" b
+  let call v vl = Llvm.build_call v (Array.of_list vl) "" b
+  let malloc t =
+    let t = Llvm.function_type (Llvm.pointer_type (Llvm.i8_type c)) [| Llvm.i32_type c |] in
+    let f = Llvm.declare_function "malloc" t m in
+    let v = Llvm.build_call f [| Llvm.size_of t |] "" b in
+    Llvm.build_pointercast v (Llvm.pointer_type t) "" b
+  let position_at_end bb = Llvm.position_at_end bb b
+  let insertion_block () = Llvm.insertion_block b
 end
 
-module Llvmgen = struct
+module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
   open Closure
 
-  let rec compile c env = function
+  module Low = L (X)
+
+  let rec compile env = function
     | Cint n ->
-        Low.int c (Nativeint.to_int n) (* FIXME *)
+        Low.int (Nativeint.to_int n) (* FIXME *)
     | Cnil _ ->
         assert false
     | Cvar id ->
         find id env
     | Cifthenelse (id, e1, e2) ->
         let v = find id env in
-        let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
-        let bb1, bb2 = Low.cond_br c v in
-        Low.position_at_end c bb1;
-        let v1 = compile c env e1 in
-        let bb1 = Low.insertion_block c in
-        Low.position_at_end c bb2;
-        let v2 = compile c env e2 in
-        let bb2 = Low.insertion_block c in
-        let bb = Low.append_block c in
-        Low.position_at_end c bb;
-        Low.phi c [v1, bb1; v2, bb2]
+        let v = Low.icmp Llvm.Icmp.Ne v (Low.int 0) in
+        let bb1, bb2 = Low.cond_br v in
+        Low.position_at_end bb1;
+        let v1 = compile env e1 in
+        let bb1 = Low.insertion_block () in
+        Low.position_at_end bb2;
+        let v2 = compile env e2 in
+        let bb2 = Low.insertion_block () in
+        let bb = Low.append_block () in
+        Low.position_at_end bb;
+        Low.phi [v1, bb1; v2, bb2]
     | Clet (id, _, e1, e2) ->
-        compile c (M.add id (compile c env e1) env) e2
+        compile (M.add id (compile env e1) env) e2
     | Capply (id, idl) ->
-        let v = Low.lookup_function c id in
+        let v = Low.lookup_function id in
         let vl = List.map (fun id -> find id env) idl in
-        Low.call c v vl
+        Low.call v vl
     | Cprimitive (Pmalloc, idl) ->
-        let v = Low.malloc c (List.length idl) in
+        let v = Low.malloc (List.length idl) in
         let vl = List.map (fun id -> find id env) idl in
-        List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
-        Low.ptrtoint c v
+        List.iteri (fun i v' -> Low.store v' (Low.gep v [Low.int i])) vl;
+        v
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1 = find id1 env in
         let v2 = find id2 env in
-        Low.add c v1 v2
+        Low.add v1 v2
     | Cprimitive (Pmulint, [id1; id2]) ->
         let v1 = find id1 env in
         let v2 = find id2 env in
-        Low.mul c v1 v2
+        Low.mul v1 v2
     | Cprimitive (Psubint, [id1; id2]) ->
         let v1 = find id1 env in
         let v2 = find id2 env in
-        Low.sub c v1 v2
+        Low.sub v1 v2
     | Cprimitive (Pload, [id]) ->
-        Low.load c (find id env)
+        Low.load (find id env)
     | Cprimitive (Pstore, [id1; id2]) ->
-        Low.store c (find id1 env) (find id2 env);
-        Llvm.undef (Low.int_type c)
+        Low.store (find id1 env) (find id2 env);
+        Llvm.undef Low.i32
     | Cprimitive (Palloca, [id]) ->
         let v = find id env in
-        let a = Low.alloca c (Llvm.type_of v) in
-        Low.store c v a;
+        let a = Low.alloca (Llvm.type_of v) in
+        Low.store v a;
         a
     | Cprimitive (Pindex, [id1; id2]) ->
         let v1 = find id1 env in
         let v2 = find id2 env in
-        Low.load c (Low.gep c v1 [v2])
+        Low.load (Low.gep v1 [v2])
     | Cprimitive _ ->
         assert false
     | Cwhile _ | Cbreak ->
         assert false
 
-  and compile_tail c env = function
+  and compile_tail env = function
     | Cint _ | Cnil _ | Cvar _ | Cprimitive _ as e ->
-        Low.ret c (compile c env e)
+        Low.ret (compile env e)
     | Cifthenelse (id, e1, e2) ->
         let v = find id env in
-        let v = Low.icmp c Llvm.Icmp.Ne v (Low.int c 0) in
-        let bb1, bb2 = Low.cond_br c v in
-        Low.position_at_end c bb1;
-        compile_tail c env e1;
-        Low.position_at_end c bb2;
-        compile_tail c env e2
+        let v = Low.icmp Llvm.Icmp.Ne v (Low.int 0) in
+        let bb1, bb2 = Low.cond_br v in
+        Low.position_at_end bb1;
+        compile_tail env e1;
+        Low.position_at_end bb2;
+        compile_tail env e2
     | Clet (id, _, e1, e2) ->
-        compile_tail c (M.add id (compile c env e1) env) e2
+        compile_tail (M.add id (compile env e1) env) e2
 (*    | Clet (id, Ptr, e1, e2) ->
         let v = compile c env e1 in
         let a = Low.alloca c (Low.int_type c) in
@@ -578,30 +533,38 @@ module Llvmgen = struct
         let a = Low.ptrtoint c a in
         compile_tail c (M.add id (a, Ptr) env) e2 *)
     | Capply _ as e ->
-        let v = compile c env e in
+        let v = compile env e in
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
-        Low.ret c v
+        Low.ret v
     | Cwhile _ ->
         assert false
     | Cbreak ->
         assert false
 
-  let compile_fun c env f body =
-    Low.position_at_end c (Llvm.entry_block f);
-    let bb = Low.append_block c in
-    Low.position_at_end c bb;
-    compile_tail c env body;
-    Low.position_at_end c (Llvm.entry_block f);
-    Low.br c bb
+  let compile_fun env f body =
+    Low.position_at_end (Llvm.entry_block f);
+    let bb = Low.append_block () in
+    Low.position_at_end bb;
+    compile_tail env body;
+    Low.position_at_end (Llvm.entry_block f);
+    Low.br bb
+
+  let rec compile_type = function
+    | Tint -> Low.i32
+    | Tpointer t -> Llvm.pointer_type (compile_type t)
+    | Tstruct id ->
+        begin match Llvm.type_by_name Low.m id with
+        | Some t -> t
+        | None -> failwith "compile_type: could not find type %S" id
+        end
 
   let compile_program (Prog (funs, main)) =
-    let c = Low.create "miniml" in
     let env =
       List.fold_left (fun env (name, args, ret, _) ->
-          let atyps = List.map (fun _ -> Low.int_type c) args in
-          let rtype = Low.int_type c in
-          let f = Low.define_function c name atyps rtype in
+          let atyps = List.map (fun (_, t) -> compile_type t) args in
+          let rtype = compile_type ret in
+          let f = Low.define_function name atyps rtype in
           Llvm.set_function_call_conv Llvm.CallConv.fast f;
           M.add name f env
         ) M.empty funs
@@ -609,26 +572,17 @@ module Llvmgen = struct
     List.iter (fun (name, args, _, body) ->
         let f = find name env in
         let params = Array.to_list (Llvm.params f) in
-        Low.position_at_end c (Llvm.entry_block f);
+        Low.position_at_end (Llvm.entry_block f);
         let env =
           List.fold_left2 (fun env (id, _) v ->
               Llvm.set_value_name id v;
-(*              let v = match k with
-                | Ptr ->
-                    let a = Low.alloca c (Low.int_type c) in
-                    Low.store c v a;
-                    Llvm.set_value_name id a;
-                    Low.ptrtoint c a
-                | Int -> v
-                in*)
               M.add id v env
             ) env args params
         in
-        compile_fun c env f body
+        compile_fun env f body
       ) funs;
-    let mainf = Low.define_function c "main" [] (Low.int_type c) in
-    compile_fun c env mainf main;
-    Low.llmodule c
+    let mainf = Low.define_function "main" [] Low.i32 in
+    compile_fun env mainf main
 end
 
 (*
@@ -669,7 +623,9 @@ let run prog =
   Format.printf "%a@.@\n" Knf.print prog;
   let prog = Closure.transl_program prog in
   Format.printf "%a@.@\n" Closure.print_program prog;
-  let m = Llvmgen.compile_program prog in
+  let m = Llvm.create_module (Llvm.create_context ()) "test" in
+  let module Llvmgen = Llvmgen (struct let m = m end) in
+  Llvmgen.compile_program prog;
   Llvm.dump_module m;
   if not (Llvm_executionengine.initialize ()) then
     failwith "Execution engine could not be initialized";
