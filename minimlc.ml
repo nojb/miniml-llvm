@@ -21,8 +21,14 @@
 
 let failwith fmt = Printf.ksprintf failwith fmt
 
+type type_ =
+  | Tint
+  | Tarray of int * type_
+  | Tpointer of type_
+  | Tstruct of string
+
 type primitive =
-  | Pmalloc
+  | Pmalloc of type_
   | Paddint
   | Pmulint
   | Psubint
@@ -32,7 +38,7 @@ type primitive =
   | Pindex
 
 let string_of_primitive = function
-  | Pmalloc -> "malloc"
+  | Pmalloc _ -> "malloc"
   | Paddint -> "+"
   | Pmulint -> "*"
   | Psubint -> "-"
@@ -51,13 +57,9 @@ module S = Set.Make (String)
 let find id env =
   try M.find id env with Not_found -> failwith "find: %S not found" id
 
-type type_ =
-  | Tint
-  | Tpointer of type_
-  | Tstruct of string
-
 let rec print_type ppf = function
   | Tint -> Format.pp_print_string ppf "int"
+  | Tarray (n, t) -> Format.fprintf ppf "%a[%d]" print_type t n
   | Tpointer t -> Format.fprintf ppf "%a*" print_type t
   | Tstruct id -> Format.pp_print_string ppf id
 
@@ -453,6 +455,8 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
 
   let rec compile_type = function
     | Tint -> Low.i32
+    | Tarray (n, t) ->
+        Llvm.array_type (compile_type t) n
     | Tpointer t -> Llvm.pointer_type (compile_type t)
     | Tstruct id ->
         begin match Llvm.type_by_name Low.m id with
@@ -486,10 +490,10 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         let v = Low.lookup_function id in
         let vl = List.map (fun id -> find id env) idl in
         Low.call v vl
-    | Cprimitive (Pmalloc, idl) ->
-        let v = Low.malloc (List.length idl) in
+    | Cprimitive (Pmalloc t, idl) ->
+        let v = Low.malloc t in
         let vl = List.map (fun id -> find id env) idl in
-        List.iteri (fun i v' -> Low.store v' (Low.gep v [Low.int i])) vl;
+        List.iteri (fun i v' -> Low.store v' (Low.gep v [Low.int 0; Low.int i])) vl;
         v
     | Cprimitive (Paddint, [id1; id2]) ->
         let v1 = find id1 env in
