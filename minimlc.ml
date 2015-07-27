@@ -39,6 +39,8 @@ module Typing = struct
     | Eint of nativeint
     | Estring of string
     | Enil
+    | Emul of exp * exp
+    | Esub of exp * exp
     | Eif of exp * exp * exp
     | Esequence of exp * exp
     | Eunit
@@ -71,6 +73,10 @@ module Typing = struct
         Format.fprintf ppf "%S" s
     | Enil ->
         Format.fprintf ppf "nil"
+    | Emul (e1, e2) ->
+        Format.fprintf ppf "@[<2>(*@ %a@ %a)@]" print e1 print e2
+    | Esub (e1, e2) ->
+        Format.fprintf ppf "@[<2>(-@ %a@ %a)@]" print e1 print e2
     | Eif (e1, e2, e3) ->
         Format.fprintf ppf "@[<2>(if@ %a@ %a@ %a)@]" print e1 print e2 print e3
     | Esequence (e1, e2) ->
@@ -329,11 +335,19 @@ module Knf = struct
         let id = gentmp () in
         Klet (id, transl_type t, desc, k id)
 
+  let save id t k =
+    match t with
+    | Typing.Tstruct _ ->
+        let id1 = gentmp () in
+        Klet (id1, Tpointer (transl_type t), Kprimitive (Palloca, [id]), k id1)
+    | _ ->
+        k id
+
   let restore id t k =
     match t with
     | Typing.Tstruct _ ->
-        let id = gentmp () in
-        Klet (id, Tpointer (transl_type t), Kprimitive (Palloca, [id]), k id)
+        let id1 = gentmp () in
+        Klet (id1, transl_type t, Kprimitive (Pload, [id]), k id1)
     | _ ->
         k id
 
@@ -344,6 +358,18 @@ module Knf = struct
         Kint n
     | Enil ->
         Knull (transl_type etype)
+    | Emul (e1, e2) ->
+        insert_let (transl e1) e1.etype
+          (fun id1 ->
+             insert_let (transl e2) e2.etype
+               (fun id2 ->
+                  Kprimitive (Pmulint, [id1; id2])))
+    | Esub (e1, e2) ->
+        insert_let (transl e1) e1.etype
+          (fun id1 ->
+             insert_let (transl e2) e2.etype
+               (fun id2 ->
+                  Kprimitive (Psubint, [id1; id2])))
     | Estring _ ->
         failwith "transl: Estring not implemented"
     | Eif (e1, e2, e3) ->
@@ -357,11 +383,13 @@ module Knf = struct
     | Eassign (lv, e) ->
         insert_let (transl_lval lv) lv.ltype
           (fun id1 ->
-             insert_let (transl e) e.etype
-               (fun id2 ->
-                  restore id1 lv.ltype
-                    (fun id1 ->
-                       Kprimitive (Pstore, [id2; id1]))))
+             save id1 lv.ltype
+               (fun id1 ->
+                  insert_let (transl e) e.etype
+                    (fun id2 ->
+                       restore id1 lv.ltype
+                         (fun id1 ->
+                            Kprimitive (Pstore, [id2; id1])))))
     | Eval lv ->
         insert_let (transl_lval lv) lv.ltype
           (fun id -> Kprimitive (Pload, [id]))
@@ -378,7 +406,11 @@ module Knf = struct
               in
               loop [] (args, el)
           | e :: el ->
-              insert_let (transl e) e.etype (fun id -> loop (id :: args) el)
+              insert_let (transl e) e.etype
+                (fun id ->
+                   save id e.etype
+                     (fun id ->
+                        loop (id :: args) el))
         in
         loop [] el
     | Ewhile (e1, e2) ->
@@ -408,8 +440,13 @@ module Knf = struct
               (fun id2 -> Kprimitive (Pindex, [id1; id2])))
 
   and transl_fun (id, args, body) =
+    let body' =
+      List.fold_right (fun (id, t) body ->
+          Klet (id, Tpointer (transl_type t), Kprimitive (Palloca, [id]), body)
+        ) args (transl body)
+    in
     let args = List.map (fun (id, t) -> (id, transl_type t)) args in
-    (id, args, transl_type body.Typing.etype, transl body)
+    (id, args, transl_type body.Typing.etype, body')
 
   let rec fv = function
     | Kint _ | Knull _ -> S.empty
@@ -884,9 +921,42 @@ let fact n =
   let main n = Clet ("x", Tint, Cint n, Capply ("fact", ["x"])) in
   {funs = prog; recs = []; main = main n}
 
+let fact2 =
+  let open Typing in
+  {edesc =
+     Eletrec
+       (["fact", ["n", Tint],
+         {edesc = Eif ({edesc = Eval ({ldesc = Lvar "n"; ltype = Tint}); etype = Tint}, {edesc = Emul ({edesc = Eval ({ldesc = Lvar "n"; ltype = Tint}); etype = Tint}, {edesc = Eapply ("fact", [{edesc = Esub ({edesc = Eval ({ldesc = Lvar "n"; ltype = Tint}); etype = Tint}, {edesc = Eint 1n; etype = Tint}); etype = Tint}]); etype = Tint}); etype = Tint}, {edesc = Eint 1n; etype = Tint});
+          etype = Tint}], {edesc = Eapply ("fact", [{edesc = Eint 10n; etype = Tint}]); etype = Tint});
+   etype = Tint}
+
+let run2 prog =
+  Format.printf "%a@.@\n" Typing.print prog;
+  let prog = Knf.transl prog in
+  Format.printf "%a@.@\n" Knf.print prog;
+  let prog = Closure.transl_program prog in
+  Format.printf "%a@.@\n" Closure.print_program prog;
+  let m = Llvm.create_module (Llvm.create_context ()) "test" in
+  let module Llvmgen = Llvmgen (struct let m = m end) in
+  Llvmgen.compile_program prog;
+  Llvm.dump_module m;
+  if not (Llvm_executionengine.initialize ()) then
+    failwith "Execution engine could not be initialized";
+  let ee = Llvm_executionengine.create m in
+  let f =
+    Llvm_executionengine.get_function_address "main"
+      Ctypes.(Foreign.funptr (void @-> returning int)) ee
+  in
+  let n = f () in
+  let c = Llvm.module_context m in
+  Llvm_executionengine.dispose ee;
+  Llvm.dispose_context c;
+  n
+
 let () =
-  Printf.printf "Result: %d\n%!" (run adder);
-  Printf.printf "Result: %d\n%!" (run fact')
+  (* Printf.printf "Result: %d\n%!" (run adder); *)
+  (* Printf.printf "Result: %d\n%!" (run fact') *)
+  Printf.printf "Result: %d\n%!" (run2 fact2)
   (* run (fact 10) *)
 
 (*
