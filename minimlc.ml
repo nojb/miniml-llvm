@@ -25,7 +25,7 @@ module Typing = struct
   type exp_type =
     | Tint
     | Tstring
-    | Tstruct of named_type
+    | Tstruct of (string * named_type)
 
   and named_type =
     | Narray of exp_type
@@ -38,7 +38,7 @@ module Typing = struct
   and exp_desc =
     | Eint of nativeint
     | Estring of string
-    | Enil of string
+    | Enil
     | Eif of exp * exp * exp
     | Esequence of exp * exp
     | Eunit
@@ -48,7 +48,7 @@ module Typing = struct
     | Ewhile of exp * exp
     | Ebreak
     | Eletvar of string * exp * exp
-    | Eletrec of (string * (string * exp_type) list * exp) * exp
+    | Eletrec of (string * (string * exp_type) list * exp) list * exp
 
   and lval =
     { ldesc : lval_desc;
@@ -56,12 +56,75 @@ module Typing = struct
 
   and lval_desc =
     | Lvar of string
-    | Lfield of lval * string
+    (* | Lfield of lval * int *)
     | Lindex of lval * exp
 
   type program =
     { typs : (string * exp_type list) list;
       prog : exp }
+
+  let rec print ppf e =
+    match e.edesc with
+    | Eint n ->
+        Format.fprintf ppf "%nd" n
+    | Estring s ->
+        Format.fprintf ppf "%S" s
+    | Enil ->
+        Format.fprintf ppf "nil"
+    | Eif (e1, e2, e3) ->
+        Format.fprintf ppf "@[<2>(if@ %a@ %a@ %a)@]" print e1 print e2 print e3
+    | Esequence (e1, e2) ->
+        let rec loop ppf e =
+          match e.edesc with
+          | Esequence (e1, e2) ->
+              Format.fprintf ppf "%a@ %a" loop e1 loop e2
+          | _ ->
+              print ppf e
+        in
+        Format.fprintf ppf "@[<2>(begin@ %a@ %a)@]" loop e1 loop e2
+    | Eunit ->
+        Format.fprintf ppf "()"
+    | Eassign (lv, e) ->
+        Format.fprintf ppf "@[<2>(set!@ %a@ %a)@]" print_lval lv print e
+    | Eval lv ->
+        print_lval ppf lv
+    | Eapply (id, args) ->
+        Format.fprintf ppf "@[<2>(%s@ %a)@]" id print_args args
+    | Ewhile (e1, e2) ->
+        Format.fprintf ppf "@[<2>(while@ %a@ %a)@]" print e1 print e2
+    | Ebreak ->
+        Format.fprintf ppf "(break)"
+    | Eletvar (id, e1, e2) ->
+        Format.fprintf ppf "@[<2>(let %s@ %a@ %a)@]" id print e1 print e2
+    | Eletrec (funs, e) ->
+        Format.fprintf ppf "@[<2>(letrec@ %a@ %a)@]" print_funs funs print e
+
+  and print_lval ppf lv =
+    match lv.ldesc with
+    | Lvar id ->
+        Format.fprintf ppf "%s" id
+    | Lindex (lv, e) ->
+        Format.fprintf ppf "@[<2>(index@ %a@ %a)@]" print_lval lv print e
+
+  and print_args ppf = function
+    | [] -> ()
+    | e :: [] -> print ppf e
+    | e :: el -> Format.fprintf ppf "%a@ %a" print e print_args el
+
+  and print_funs ppf = function
+    | [] -> ()
+    | (id, params, body) :: [] ->
+        Format.fprintf ppf "@[(%s@ (%a)@ %a)@]" id print_params params print body
+    | (id, params, body) :: funs ->
+        Format.fprintf ppf "@[(%s@ (%a)@ %a)@ %a@]"
+          id print_params params print body print_funs funs
+
+  and print_params ppf = function
+    | [] -> ()
+    | (id, _) :: [] ->
+        Format.fprintf ppf "%s" id
+    | (id, _) :: params ->
+        Format.fprintf ppf "%s@ %a" id print_params params
 end
 
 type type_ =
@@ -109,7 +172,7 @@ let rec print_type ppf = function
 module Knf = struct
   type knf =
     | Kint of nativeint
-    | Knil of string
+    | Knull of type_
     | Kvar of string
     | Kifthenelse of string * knf * knf
     | Klet of string * type_ * knf * knf
@@ -208,8 +271,8 @@ module Knf = struct
   let rec print ppf = function
     | Kint n ->
         Format.fprintf ppf "%nd" n
-    | Knil _ ->
-        Format.pp_print_string ppf "nil"
+    | Knull _ ->
+        Format.pp_print_string ppf "null"
     | Kvar id ->
         Format.pp_print_string ppf id
     | Kifthenelse (id, e1, e2) ->
@@ -248,8 +311,108 @@ module Knf = struct
     | f :: funs ->
         Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
 
+  let all_types : (string * type_ list) list ref = ref []
+
+  let rec transl_type = function
+    | Typing.Tint -> Tint
+    | Typing.Tstring -> failwith "transl_type: Tstring not implemented"
+    | Typing.Tstruct (id, Typing.Nrecord fields) ->
+        all_types := (id, List.map transl_type fields) :: !all_types;
+        Tpointer (Tstruct id)
+    | Typing.Tstruct (id, Typing.Narray t) ->
+        Tpointer (Tarray (0, transl_type t))
+
+  let insert_let desc t k =
+    match desc with
+    | Kvar id -> k id
+    | _ ->
+        let id = gentmp () in
+        Klet (id, transl_type t, desc, k id)
+
+  let restore id t k =
+    match t with
+    | Typing.Tstruct _ ->
+        let id = gentmp () in
+        Klet (id, Tpointer (transl_type t), Kprimitive (Palloca, [id]), k id)
+    | _ ->
+        k id
+
+  let rec transl {Typing.edesc; etype} =
+    let open Typing in
+    match edesc with
+    | Eint n ->
+        Kint n
+    | Enil ->
+        Knull (transl_type etype)
+    | Estring _ ->
+        failwith "transl: Estring not implemented"
+    | Eif (e1, e2, e3) ->
+        insert_let (transl e1) e1.etype
+          (fun id1 -> Kifthenelse (id1, transl e2, transl e3))
+    | Esequence (e1, e2) ->
+        insert_let (transl e1) e1.etype
+          (fun _ -> transl e2)
+    | Eunit ->
+        Kint 0n
+    | Eassign (lv, e) ->
+        insert_let (transl_lval lv) lv.ltype
+          (fun id1 ->
+             insert_let (transl e) e.etype
+               (fun id2 ->
+                  restore id1 lv.ltype
+                    (fun id1 ->
+                       Kprimitive (Pstore, [id2; id1]))))
+    | Eval lv ->
+        insert_let (transl_lval lv) lv.ltype
+          (fun id -> Kprimitive (Pload, [id]))
+    | Eapply (id, el) ->
+        let rec loop args = function
+          | [] ->
+              let rec loop args = function
+                | [], [] ->
+                    Kapply (id, args)
+                | id :: idl, e :: el ->
+                    restore id e.etype (fun id -> loop (id :: args) (idl, el))
+                | _ ->
+                    assert false
+              in
+              loop [] (args, el)
+          | e :: el ->
+              insert_let (transl e) e.etype (fun id -> loop (id :: args) el)
+        in
+        loop [] el
+    | Ewhile (e1, e2) ->
+        Kloop
+          (insert_let (transl e1) e1.etype
+             (fun id -> Kifthenelse (id, transl e2, Kbreak Tint)))
+    | Ebreak ->
+        Kbreak (transl_type etype)
+    | Eletvar (id, e1, e2) ->
+        insert_let (transl e1) e1.etype
+          (fun id1 ->
+             Klet
+               (id, Tpointer (transl_type e1.etype), Kprimitive (Palloca, [id1]), transl e2))
+    | Eletrec (funs, e) ->
+        let funs = List.map transl_fun funs in
+        Kletrec (funs, transl e)
+
+  and transl_lval {Typing.ldesc; ltype} =
+    let open Typing in
+    match ldesc with
+    | Lvar id ->
+        Kvar id
+    | Lindex (lv, e) ->
+        insert_let (transl_lval lv) lv.ltype
+          (fun id1 ->
+            insert_let (transl e) e.etype
+              (fun id2 -> Kprimitive (Pindex, [id1; id2])))
+
+  and transl_fun (id, args, body) =
+    let args = List.map (fun (id, t) -> (id, transl_type t)) args in
+    (id, args, transl_type body.Typing.etype, transl body)
+
   let rec fv = function
-    | Kint _ | Knil _ -> S.empty
+    | Kint _ | Knull _ -> S.empty
     | Kvar id -> S.singleton id
     | Kifthenelse (id, e1, e2) -> S.add id (S.union (fv e1) (fv e2))
     | Klet (id, _, e1, e2) -> S.union (fv e1) (S.remove id (fv e2))
@@ -270,7 +433,7 @@ end
 module Closure = struct
   type clambda =
     | Cint of nativeint
-    | Cnil of string
+    | Cnull of type_
     | Cvar of string
     | Cifthenelse of string * clambda * clambda
     | Clet of string * type_ * clambda * clambda
@@ -359,7 +522,7 @@ module Closure = struct
   let rec print ppf = function
     | Cint n ->
         Format.fprintf ppf "%nd" n
-    | Cnil _ ->
+    | Cnull _ ->
         Format.fprintf ppf "nil"
     | Cvar id ->
         Format.pp_print_string ppf id
@@ -407,8 +570,8 @@ module Closure = struct
   let rec transl clos env = function
     | Kint n ->
         Cint n
-    | Knil id ->
-        Cnil id
+    | Knull t ->
+        Cnull t
     | Kvar id ->
         Cvar id
     | Kifthenelse (id, e1, e2) ->
@@ -515,8 +678,8 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
   let rec compile brk env = function
     | Cint n ->
         Low.int (Nativeint.to_int n) (* FIXME *)
-    | Cnil t ->
-        Llvm.const_null (Llvm.pointer_type (Low.type_by_name t))
+    | Cnull t ->
+        Llvm.const_null (compile_type t)
     | Cvar id ->
         find id env
     | Cifthenelse (id, e1, e2) ->
@@ -589,7 +752,7 @@ module Llvmgen (X : sig val m : Llvm.llmodule end) = struct
         end
 
   and compile_tail env = function
-    | Cint _ | Cnil _ | Cvar _ | Cprimitive _ | Cloop _ as e ->
+    | Cint _ | Cnull _ | Cvar _ | Cprimitive _ | Cloop _ as e ->
         Low.ret (compile None env e)
     | Cifthenelse (id, e1, e2) ->
         let v = find id env in
