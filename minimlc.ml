@@ -444,6 +444,8 @@ module Llvmgen = struct
         Llvm.build_sub (find id1 env) (find id2 env) "" env.b
     | Cprimitive (Pmul, [id1; id2]) ->
         Llvm.build_mul (find id1 env) (find id2 env) "" env.b
+    | Cprimitive (Palloca t, []) ->
+        Llvm.build_alloca (compile_type env t) "" env.b
     | Cprimitive (Pload, [id]) ->
         Llvm.build_load (find id env) "" env.b
     | Cprimitive (Pstore, [idv; idp]) ->
