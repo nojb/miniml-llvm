@@ -206,13 +206,14 @@ module Closure = struct
     | Padd
     | Psub
     | Pmul
-    | Palloca of typ
     | Pload
     | Pstore
     | Pgep
 
   type cvalue =
     | Vint of nativeint
+    | Vmalloc of typ
+    | Valloca of typ
 
   type clambda =
     | Cifthenelse of string * string * string
@@ -307,7 +308,6 @@ module Closure = struct
     | Padd -> Format.fprintf ppf "+"
     | Psub -> Format.fprintf ppf "-"
     | Pmul -> Format.fprintf ppf "*"
-    | Palloca t -> Format.fprintf ppf "alloca@ %a" print_type t
     | Pload -> Format.fprintf ppf "load"
     | Pstore -> Format.fprintf ppf "store"
     | Pgep -> Format.fprintf ppf "gep"
@@ -315,6 +315,10 @@ module Closure = struct
   let print_value ppf = function
     | Vint n ->
         Format.fprintf ppf "%nd" n
+    | Vmalloc t ->
+        Format.fprintf ppf "@[<2>(malloc@ %a)@]" print_type t
+    | Valloca t ->
+        Format.fprintf ppf "@[<2>(alloca@ %a)@]" print_type t
 
   let rec print ppf = function
     | Cifthenelse (id, k1, k2) ->
@@ -414,6 +418,10 @@ module Llvmgen = struct
   let compile_value env = function
     | Vint n ->
         Llvm.const_of_int64 (Llvm.i32_type env.c) (Int64.of_nativeint n) true
+    | Vmalloc _ ->
+        assert false
+    | Valloca t ->
+        Llvm.build_alloca (compile_type env t) "" env.b
 
   let compile_primitive env p vl =
     match p, vl with
@@ -423,12 +431,12 @@ module Llvmgen = struct
         Llvm.build_sub v1 v2 "" env.b
     | Pmul, [v1; v2] ->
         Llvm.build_mul v1 v2 "" env.b
-    | Palloca t, [] ->
-        Llvm.build_alloca (compile_type env t) "" env.b
     | Pload, [v] ->
         Llvm.build_load v "" env.b
     | Pstore, [v; p] ->
         Llvm.build_store v p env.b
+    | Pgep, v :: vl ->
+        Llvm.build_gep v (Array.of_list vl) "" env.b
     | _ ->
         assert false
 
