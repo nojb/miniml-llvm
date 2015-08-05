@@ -211,16 +211,19 @@ module Closure = struct
     | Pstore
     | Pgep
 
+  type cvalue =
+    | Vint of nativeint
+
   type clambda =
-    | Cint of nativeint
-    | Cvar of string
-    | Cifthenelse of string * clambda * clambda
-    | Clet of string * typ * clambda * clambda
-    | Capply of string * string list
-    | Cprimitive of primitive * string list
+    | Cifthenelse of string * string * string
+    | Clet of string * typ * primitive * string list * clambda
+    | Cletval of string * typ * cvalue * clambda
+    | Capply of string * string list * string
+    | Cletcont of string * (string * typ) * clambda * clambda
+    | Cgoto of string * string
 
   type program =
-    | Prog of (string * (string * typ) list * typ * clambda) list * string
+    | Prog of (string * (string * typ) list * (string * typ) * clambda) list
 
   (*
   type value =
@@ -309,19 +312,26 @@ module Closure = struct
     | Pstore -> Format.fprintf ppf "store"
     | Pgep -> Format.fprintf ppf "gep"
 
-  let rec print ppf = function
-    | Cint n ->
+  let print_value ppf = function
+    | Vint n ->
         Format.fprintf ppf "%nd" n
-    | Cvar id ->
-        Format.pp_print_string ppf id
-    | Cifthenelse (id, e1, e2) ->
-        Format.fprintf ppf "@[<2>(if %s@ %a@ %a)@]" id print e1 print e2
-    | Clet (id, t, e1, e2) ->
-        Format.fprintf ppf "@[<2>(let (%s@ %a@ %a)@ %a)@]" id print_type t print e1 print e2
-    | Capply (id, idl) ->
-        Format.fprintf ppf "@[<2>(%s%a)@]" id print_args idl
-    | Cprimitive (prim, idl) ->
-        Format.fprintf ppf "@[<2>(%a%a)@]" print_primitive prim print_args idl
+
+  let rec print ppf = function
+    | Cifthenelse (id, k1, k2) ->
+        Format.fprintf ppf "@[<2>(if %s@ (%s)@ (%s))@]" id k1 k2
+    | Cletval (id, _, v, e) ->
+        Format.fprintf ppf "@[<2>(let (%s@ %a)@ %a)@]"
+          id print_value v print e
+    | Clet (id, _, p, idl, e) ->
+        Format.fprintf ppf "@[<2>(let (%s@ (%a%a))@ %a)@]"
+          id print_primitive p print_args idl print e
+    | Cletcont (id, (arg, _), e1, e2) ->
+        Format.fprintf ppf "@[<2>(let (%s@ (%s)@ %a)@ %a)@]"
+          id arg print e1 print e2
+    | Capply (id, idl, k) ->
+        Format.fprintf ppf "@[<2>(%s%a@ %s)@]" id print_args idl k
+    | Cgoto (k, x) ->
+        Format.fprintf ppf "@[<2>(%s@ %s)@]" k x
 
   and print_args ppf = function
     | [] -> ()
@@ -337,15 +347,8 @@ module Closure = struct
   let print_fun ppf (name, params, _, body) =
     Format.fprintf ppf "@[<2>(%s@ (%a)@ %a)@]" name print_params params print body
 
-  let rec print_funs ppf = function
-    | [] -> ()
-    | f :: [] ->
-        print_fun ppf f
-    | f :: funs ->
-        Format.fprintf ppf "%a@ %a" print_fun f print_funs funs
-
-  let print_program ppf (Prog (funs, main)) =
-    Format.fprintf ppf "@[<2>(letrec@ @[<v>%a@ (%s)@])@]" print_funs funs main
+  let print_program ppf (Prog funs) =
+    List.iter (Format.fprintf ppf "@[%a@]@." print_fun) funs
 
 (*  open Knf
 
@@ -386,94 +389,150 @@ end
 module Llvmgen = struct
   open Closure
 
+  type phi_info =
+    | Empty of Llvm.llvalue
+    | NonEmpty of Llvm.llvalue
+
+  type cont_info =
+    | Return
+    | Block of Llvm.llbasicblock * phi_info ref
+
   type env =
     { m : Llvm.llmodule;
       b : Llvm.llbuilder;
       c : Llvm.llcontext;
-      e : Llvm.llvalue M.t }
+      e : Llvm.llvalue M.t;
+      k : cont_info M.t }
 
-  let find id env = find id env.e
+  let finde id env = find id env.e
   let add id x env = {env with e = M.add id x env.e}
 
   let rec compile_type env = function
     | Tint -> Llvm.i32_type env.c
     | Tpointer t -> Llvm.pointer_type (compile_type env t)
 
-  let rec compile env = function
-    | Cint n ->
+  let compile_value env = function
+    | Vint n ->
         Llvm.const_of_int64 (Llvm.i32_type env.c) (Int64.of_nativeint n) true
-    | Cvar id ->
-        find id env
-    | Cifthenelse (id, e1, e2) ->
-        let v = find id env in
+
+  let compile_primitive env p vl =
+    match p, vl with
+    | Padd, [v1; v2] ->
+        Llvm.build_add v1 v2 "" env.b
+    | Psub, [v1; v2] ->
+        Llvm.build_sub v1 v2 "" env.b
+    | Pmul, [v1; v2] ->
+        Llvm.build_mul v1 v2 "" env.b
+    | Palloca t, [] ->
+        Llvm.build_alloca (compile_type env t) "" env.b
+    | Pload, [v] ->
+        Llvm.build_load v "" env.b
+    | Pstore, [v; p] ->
+        Llvm.build_store v p env.b
+    | _ ->
+        assert false
+
+  let rec compile env = function
+    | Cifthenelse (id, k1, k2) ->
         let zero = Llvm.const_int (Llvm.i32_type env.c) 0 in
-        let v = Llvm.build_icmp Llvm.Icmp.Ne v zero "" env.b in
+        let v = Llvm.build_icmp Llvm.Icmp.Ne (finde id env) zero "" env.b in
+        let x = Llvm.const_int (Llvm.i32_type env.c) 0 in
+        let cont k = match find k env.k with
+          | Return ->
+              let f = Llvm.block_parent (Llvm.insertion_block env.b) in
+              let bb = Llvm.append_block env.c "" f in
+              let b = Llvm.builder_at_end env.c bb in
+              ignore (Llvm.build_ret x b);
+              bb
+          | Block (bb, phis) ->
+              let bb' = Llvm.insertion_block env.b in
+              begin match !phis with
+              | Empty dummy ->
+                  let pos = Llvm.instr_begin bb in
+                  let b = Llvm.builder_at env.c pos in
+                  let phi = Llvm.build_phi [x, bb'] "" b in
+                  Llvm.replace_all_uses_with dummy phi;
+                  phis := NonEmpty phi
+              | NonEmpty phi ->
+                  Llvm.add_incoming (x, bb') phi
+              end;
+              bb
+        in
+        ignore (Llvm.build_cond_br v (cont k1) (cont k2) env.b);
+    | Clet (id, _, p, idl, e) ->
+        compile (add id (compile_primitive env p (List.map (fun id -> finde id env) idl)) env) e
+    | Cletval (id, _, v, e) ->
+        compile (add id (compile_value env v) env) e
+    | Cletcont (k, (x, t), e1, e2) ->
         let f = Llvm.block_parent (Llvm.insertion_block env.b) in
-        let bb1 = Llvm.append_block env.c "" f in
-        let bb2 = Llvm.append_block env.c "" f in
-        ignore (Llvm.build_cond_br v bb1 bb2 env.b);
-        Llvm.position_at_end bb1 env.b;
-        let v1 = compile env e1 in
-        let bb1 = Llvm.insertion_block env.b in
-        Llvm.position_at_end bb2 env.b;
-        let v2 = compile env e2 in
-        let bb2 = Llvm.insertion_block env.b in
         let bb = Llvm.append_block env.c "" f in
-        Llvm.position_at_end bb env.b;
-        Llvm.build_phi [v1, bb1; v2, bb2] "" env.b
-    | Clet (id, _, e1, e2) ->
-        compile (add id (compile env e1) env) e2
-(*    | Clet (id, Ptr, e1, e2) ->
-        let v = compile c env e1 in
-        let a = Low.alloca c (Low.int_type c) in
-        Low.store c v a;
-        let a' = Low.ptrtoint c a in
-        let v = compile c (M.add id (a', Ptr) env) e2 in
-        Low.store c (Llvm.const_null (Low.int_type c)) a;
-        v *)
-    | Capply (id, idl) ->
+        let dummy = Llvm.undef (compile_type env t) in
+        let env = {env with k = M.add k (Block (bb, ref (Empty dummy))) env.k} in
+        compile (add x dummy {env with b = Llvm.builder_at_end env.c bb}) e1;
+        compile env e2
+
+    (*    | Cprimitive (Pmakeblock, idl) ->
+            let v = Low.malloc c (List.length idl) in
+            let vl = List.map (var c env) idl in
+            List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
+            Low.ptrtoint c v
+          | Cprimitive (Pgetfield i, [id]) ->
+            let v = var c env id in
+            let v = Low.inttoptr c v (Low.ptr_type c) in
+            Low.load c (Low.gep c v [Low.int c i]) *)
+    (*    | Clet (id, Ptr, e1, e2) ->
+            let v = compile c env e1 in
+            let a = Low.alloca c (Low.int_type c) in
+            Low.store c v a;
+            let a' = Low.ptrtoint c a in
+            let v = compile c (M.add id (a', Ptr) env) e2 in
+            Low.store c (Llvm.const_null (Low.int_type c)) a;
+            v *)
+    | Capply (id, idl, k) ->
         let v = match Llvm.lookup_function id env.m with
           | None -> failwith "Function %S not found" id
           | Some f -> f
         in
-        let vl = List.map (fun id -> find id env) idl in
-        Llvm.build_call v (Array.of_list vl) "" env.b
-    | Cprimitive (Padd, [id1; id2]) ->
-        Llvm.build_add (find id1 env) (find id2 env) "" env.b
-    | Cprimitive (Psub, [id1; id2]) ->
-        Llvm.build_sub (find id1 env) (find id2 env) "" env.b
-    | Cprimitive (Pmul, [id1; id2]) ->
-        Llvm.build_mul (find id1 env) (find id2 env) "" env.b
-    | Cprimitive (Palloca t, []) ->
-        Llvm.build_alloca (compile_type env t) "" env.b
-    | Cprimitive (Pload, [id]) ->
-        Llvm.build_load (find id env) "" env.b
-    | Cprimitive (Pstore, [idv; idp]) ->
-        Llvm.build_store (find idv env) (find idp env) env.b
-(*    | Cprimitive (Pmakeblock, idl) ->
-        let v = Low.malloc c (List.length idl) in
-        let vl = List.map (var c env) idl in
-        List.iteri (fun i v' -> Low.store c v' (Low.gep c v [Low.int c i])) vl;
-        Low.ptrtoint c v
-    | Cprimitive (Pgetfield i, [id]) ->
-        let v = var c env id in
-        let v = Low.inttoptr c v (Low.ptr_type c) in
-        Low.load c (Low.gep c v [Low.int c i])
-    | Cprimitive (Paddint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
-        Low.add c v1 v2
-    | Cprimitive (Pmulint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
-        Low.mul c v1 v2
-    | Cprimitive (Psubint, [id1; id2]) ->
-        let v1, _ = find id1 env in
-        let v2, _ = find id2 env in
-        Low.sub c v1 v2 *)
-    | Cprimitive _ ->
-        assert false
+        let vl = List.map (fun id -> finde id env) idl in
+        let cont k x = match find k env.k with
+          | Return ->
+              ignore (Llvm.build_ret x env.b)
+          | Block (bb, phis) ->
+              let bb' = Llvm.insertion_block env.b in
+              begin match !phis with
+              | Empty dummy ->
+                  let pos = Llvm.instr_begin bb in
+                  let b = Llvm.builder_at env.c pos in
+                  let phi = Llvm.build_phi [x, bb'] "" b in
+                  Llvm.replace_all_uses_with dummy phi;
+                  phis := NonEmpty phi
+              | NonEmpty phi ->
+                  Llvm.add_incoming (x, bb') phi
+              end;
+              ignore (Llvm.build_br bb env.b)
+        in
+        cont k (Llvm.build_call v (Array.of_list vl) "" env.b)
+    | Cgoto (k, x) ->
+        let cont k x = match find k env.k with
+          | Return ->
+              ignore (Llvm.build_ret x env.b)
+          | Block (bb, phis) ->
+              let bb' = Llvm.insertion_block env.b in
+              begin match !phis with
+              | Empty dummy ->
+                  let pos = Llvm.instr_begin bb in
+                  let b = Llvm.builder_at env.c pos in
+                  let phi = Llvm.build_phi [x, bb'] "" b in
+                  Llvm.replace_all_uses_with dummy phi;
+                  phis := NonEmpty phi
+              | NonEmpty phi ->
+                  Llvm.add_incoming (x, bb') phi
+              end;
+              ignore (Llvm.build_br bb env.b)
+        in
+        cont k (find x env.e)
 
+  (*
   and compile_tail env = function
     | Cint _ | Cvar _ | Cprimitive _ as e -> (* TODO tail call *)
         ignore (Llvm.build_ret (compile env e) env.b)
@@ -502,55 +561,57 @@ module Llvmgen = struct
         Llvm.set_instruction_call_conv Llvm.CallConv.fast v;
         Llvm.set_tail_call true v;
         ignore (Llvm.build_ret v env.b)
+*)
 
-  let compile_fun env f body =
-    Llvm.position_at_end (Llvm.entry_block f) env.b;
-    let bb = Llvm.append_block env.c "" f in
-    Llvm.position_at_end bb env.b;
-    compile_tail env body;
-    Llvm.position_at_end (Llvm.entry_block f) env.b;
-    ignore (Llvm.build_br bb env.b)
+        let compile_fun env f body =
+          Llvm.position_at_end (Llvm.entry_block f) env.b;
+          let bb = Llvm.append_block env.c "" f in
+          Llvm.position_at_end bb env.b;
+          compile env body;
+          Llvm.position_at_end (Llvm.entry_block f) env.b;
+          ignore (Llvm.build_br bb env.b)
 
-  let compile_program (Prog (funs, main)) =
-    let c = Llvm.create_context () in
-    let m = Llvm.create_module c "miniml" in
-    let b = Llvm.builder c in
-    let env = {c; m; b; e = M.empty} in
-    List.iter (fun (name, args, ret, _) ->
-        let atyps = List.map (fun (_, t) -> compile_type env t) args in
-        let rtype = compile_type env ret in
-        let f =
-          Llvm.define_function name
-            (Llvm.function_type rtype (Array.of_list atyps)) env.m
-        in
-        Llvm.set_function_call_conv Llvm.CallConv.fast f
-      ) funs;
-    List.iter (fun (name, args, k, body) ->
-        let f = match Llvm.lookup_function name env.m with
-          | None -> failwith "Function %S not found" name
-          | Some f -> f
-        in
-        let params = Array.to_list (Llvm.params f) in
-        Llvm.position_at_end (Llvm.entry_block f) env.b;
-        let env =
-          List.fold_left2 (fun env (id, _) v ->
-              Llvm.set_value_name id v;
-              add id v env
-            ) env args params
-        in
-        compile_fun env f body
-      ) funs;
-    let mainf =
-      Llvm.define_function "main" (Llvm.function_type (Llvm.i32_type env.c) [| |]) env.m
-    in
-    Llvm.position_at_end (Llvm.entry_block mainf) env.b;
-    let f = match Llvm.lookup_function main env.m with
-      | None -> failwith "Function %S not found" main
-      | Some f -> f
-    in
-    ignore (Llvm.build_ret (Llvm.build_call f [| |] "" env.b) env.b);
-    env.m
-end
+        let compile_program (Prog funs) =
+          let c = Llvm.create_context () in
+          let m = Llvm.create_module c "miniml" in
+          let b = Llvm.builder c in
+          let env = {c; m; b; e = M.empty; k = M.empty} in
+          List.iter (fun (name, args, (_, ret), _) ->
+              let atyps = List.map (fun (_, t) -> compile_type env t) args in
+              let rtype = compile_type env ret in
+              let f =
+                Llvm.define_function name
+                  (Llvm.function_type rtype (Array.of_list atyps)) env.m
+              in
+              Llvm.set_function_call_conv Llvm.CallConv.fast f
+            ) funs;
+          List.iter (fun (name, args, (k, _), body) ->
+              let f = match Llvm.lookup_function name env.m with
+                | None -> failwith "Function %S not found" name
+                | Some f -> f
+              in
+              let params = Array.to_list (Llvm.params f) in
+              Llvm.position_at_end (Llvm.entry_block f) env.b;
+              let env =
+                List.fold_left2 (fun env (id, _) v ->
+                    Llvm.set_value_name id v;
+                    add id v env
+                  ) env args params
+              in
+              let env = {env with k = M.add k Return env.k} in
+              compile_fun env f body
+            ) funs;
+          (* let mainf = *)
+          (*   Llvm.define_function "main" (Llvm.function_type (Llvm.i32_type env.c) [| |]) env.m *)
+          (* in *)
+          (* Llvm.position_at_end (Llvm.entry_block mainf) env.b; *)
+          (* let f = match Llvm.lookup_function main env.m with *)
+          (*   | None -> failwith "Function %S not found" main *)
+          (*   | Some f -> f *)
+          (* in *)
+          (* ignore (Llvm.build_ret (Llvm.build_call f [| |] "" env.b) env.b); *)
+          env.m
+        end
 
 (*
 
@@ -606,24 +667,44 @@ let run prog =
   Llvm.dispose_context c;
   n
 
+(*
+let fact n k =
+  letcont k0 _ =
+    let c1 = 1 in
+    let x1 = n - c1 in
+    letcont k2 x2 =
+      let x3 = n * x2 in
+      k x3
+    in
+    fact x1 k2
+  in
+  letcont k1 _ =
+    let r = 1 in
+    k r
+  in
+  if n then k0 () else k1 ()
+*)
+
 let fact n =
   let open Closure in
-  let fact =
-    Cifthenelse
-      ("n", Clet
-         ("c1", Tint, Cint 1n, Clet
-            ("x1", Tint, Cprimitive (Psub, ["n"; "c1"]), Clet
-               ("x2", Tint, Capply ("fact", ["x1"]), Cprimitive (Pmul, ["n"; "x2"])))),
-       Cint 1n)
+  let fact n k =
+    Cletcont
+      ("k0", ("_", Tint),
+       Cletval
+         ("c1", Tint, Vint 1n, Clet
+            ("x1", Tint, Psub, ["n"; "c1"], Cletcont
+               ("k2", ("x2", Tint), Clet ("x3", Tint, Pmul, ["n"; "x2"], Cgoto (k, "x3")),
+                Capply ("fact", ["x1"], "k2")
+               ))),
+       Cletcont ("k1", ("_", Tint), Cletval ("r", Tint, Vint 1n, Cgoto ("k", "r")),
+                 Cifthenelse ("n", "k0", "k1")))
   in
-  let fact10 = Clet ("x", Tint, Cint 10n, Capply ("fact", ["x"])) in
-  let prog =
+  let funs =
     [
-      "fact", ["n", Tint], Tint, fact;
-      "fact10", [], Tint, fact10;
+      "fact", ["n", Tint], ("k", Tint), fact "n" "k";
     ]
   in
-  Prog (prog, "fact10")
+  Prog funs
 
 let () =
   Printf.printf "Result: %d\n%!" (run (fact 10));
