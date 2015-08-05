@@ -216,6 +216,7 @@ module Closure = struct
     | Valloca of typ
 
   type clambda =
+    | Cswitch of string * (int * string) list * string
     | Cifthenelse of string * string * string
     | Clet of string * typ * primitive * string list * clambda
     | Cletval of string * typ * cvalue * clambda
@@ -321,6 +322,8 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(alloca@ %a)@]" print_type t
 
   let rec print ppf = function
+    | Cswitch (id, cases, orelse) ->
+        Format.fprintf ppf "@[<2>(switch %s@ %a@ %s)@]" id print_cases cases orelse
     | Cifthenelse (id, k1, k2) ->
         Format.fprintf ppf "@[<2>(if %s@ (%s)@ (%s))@]" id k1 k2
     | Cletval (id, _, v, e) ->
@@ -336,6 +339,11 @@ module Closure = struct
         Format.fprintf ppf "@[<2>(%s%a@ %s)@]" id print_args idl k
     | Cgoto (k, x) ->
         Format.fprintf ppf "@[<2>(%s@ %s)@]" k x
+
+  and print_cases ppf = function
+    | [] -> ()
+    | (id, k) :: cases ->
+        Format.fprintf ppf "@[<2>(%d@ %s)@ %a@]" id k print_cases cases
 
   and print_args ppf = function
     | [] -> ()
@@ -441,6 +449,33 @@ module Llvmgen = struct
         assert false
 
   let rec compile env = function
+    | Cswitch (id, cases, orelse) ->
+        let z = Llvm.const_int (Llvm.i32_type env.c) 0 in
+        let cont k = match find k env.k with
+          | Return ->
+              let f = Llvm.block_parent (Llvm.insertion_block env.b) in
+              let bb = Llvm.append_block env.c "" f in
+              let b = Llvm.builder_at_end env.c bb in
+              ignore (Llvm.build_ret z b);
+              bb
+          | Block (bb, phis) ->
+              let bb' = Llvm.insertion_block env.b in
+              begin match !phis with
+              | Empty dummy ->
+                  let pos = Llvm.instr_begin bb in
+                  let b = Llvm.builder_at env.c pos in
+                  let phi = Llvm.build_phi [z, bb'] "" b in
+                  Llvm.replace_all_uses_with dummy phi;
+                  phis := NonEmpty phi
+              | NonEmpty phi ->
+                  Llvm.add_incoming (z, bb') phi
+              end;
+              bb
+        in
+        let sw = Llvm.build_switch (finde id env) (cont orelse) (List.length cases) env.b in
+        List.iter (fun (n, k) ->
+            Llvm.add_case sw (Llvm.const_int (Llvm.i32_type env.c) n) (cont k)
+          ) cases
     | Cifthenelse (id, k1, k2) ->
         let zero = Llvm.const_int (Llvm.i32_type env.c) 0 in
         let v = Llvm.build_icmp Llvm.Icmp.Ne (finde id env) zero "" env.b in
